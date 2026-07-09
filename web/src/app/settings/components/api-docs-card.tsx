@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { ChevronDown, FileArchive, FileText, KeyRound, ListChecks, type LucideIcon } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
-import webConfig from "@/constants/common-env";
+import { getApiBaseUrl } from "@/lib/paths";
 import { getStoredAuthSession } from "@/store/auth";
 
 type ParamRow = [string, string, string];
@@ -244,7 +244,7 @@ function ParamTable({ rows }: { rows: ParamRow[] }) {
 
 export function ApiDocsCard() {
   const [authKey, setAuthKey] = useState("");
-  const serviceBaseUrl = webConfig.apiUrl.replace(/\/$/, "") || (typeof window !== "undefined" ? window.location.origin : "");
+  const serviceBaseUrl = getApiBaseUrl(typeof window !== "undefined" ? window.location.origin : "");
   const openAIBaseUrl = `${serviceBaseUrl}/v1`;
   const displayKey = authKey || "<当前密钥>";
 

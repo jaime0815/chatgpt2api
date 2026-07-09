@@ -31,6 +31,14 @@ docker compose up -d
 - API 地址：`http://localhost:3000/v1`
 - 数据目录：`./data`
 
+如需把 Web 面板和同源 API 挂到 nginx 子路径下，构建前端时设置 `NEXT_PUBLIC_BASE_PATH`，例如 `/chatgpt2api`。该值会让页面、`/_next` 静态资源、public 图标和同源 `/api`、`/v1` 请求都走同一前缀：
+
+```bash
+NEXT_PUBLIC_BASE_PATH=/chatgpt2api docker compose -f docker-compose.local.yml up -d --build
+```
+
+预构建镜像的前端静态资源已在镜像构建时确定；子路径部署需要使用带 `NEXT_PUBLIC_BASE_PATH` 的自构建镜像。
+
 ### WARP / FlareSolverr 稳定代理部署
 
 如果图片链路经常遇到 Cloudflare 拦截，可以启用附带的 WARP + Privoxy + FlareSolverr 方案：
@@ -69,6 +77,12 @@ uv run main.py
 cd chatgpt2api/web
 bun install
 bun run dev
+```
+
+如果前端需要以子路径方式本地构建或部署：
+
+```bash
+NEXT_PUBLIC_BASE_PATH=/chatgpt2api bun run build
 ```
 
 后续更新新版本：

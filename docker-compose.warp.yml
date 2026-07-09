@@ -86,6 +86,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-}
     image: chatgpt2api:warp
     container_name: chatgpt2api-warp
     restart: unless-stopped
@@ -106,3 +108,4 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      CHATGPT2API_WEB_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-}

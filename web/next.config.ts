@@ -6,6 +6,15 @@ import { parseChangelog } from './src/lib/release'
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 
+function normalizeBasePath(value: string | undefined) {
+    const trimmed = String(value || '').trim()
+    if (!trimmed || trimmed === '/') {
+        return ''
+    }
+    const prefixed = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+    return prefixed.replace(/\/+$/, '')
+}
+
 function readAppVersion() {
     try {
         const version = readFileSync(join(projectRoot, 'VERSION'), 'utf-8').trim()
@@ -16,6 +25,7 @@ function readAppVersion() {
 }
 
 const appVersion = process.env.NEXT_PUBLIC_APP_VERSION || readAppVersion()
+const appBasePath = normalizeBasePath(process.env.NEXT_PUBLIC_BASE_PATH || process.env.CHATGPT2API_WEB_BASE_PATH)
 let appReleases = '[]'
 try {
     appReleases = JSON.stringify(parseChangelog(readFileSync(join(projectRoot, 'CHANGELOG.md'), 'utf-8')))
@@ -26,7 +36,9 @@ const nextConfig: NextConfig = {
     env: {
         NEXT_PUBLIC_APP_VERSION: appVersion,
         NEXT_PUBLIC_APP_RELEASES: appReleases,
+        NEXT_PUBLIC_BASE_PATH: appBasePath,
     },
+    ...(appBasePath ? { basePath: appBasePath } : {}),
     output: 'export',
     trailingSlash: true,
     images: {

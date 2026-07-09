@@ -58,6 +58,7 @@ import {
   type Model,
   type RefreshProgressResponse,
 } from "@/lib/api";
+import { withBasePath } from "@/lib/paths";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
@@ -887,7 +888,7 @@ function AccountsPageContent() {
                     title={`点击复制 ${model.id}`}
                   >
                     <img
-                      src="/openai.svg"
+                      src={withBasePath("/openai.svg")}
                       alt=""
                       aria-hidden="true"
                       className="mr-1.5 size-3.5 shrink-0"

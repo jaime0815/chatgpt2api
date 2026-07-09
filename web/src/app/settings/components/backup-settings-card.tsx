@@ -10,7 +10,6 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import webConfig from "@/constants/common-env";
 import { fetchBackupDetail, getBackupDownloadUrl, type BackupDetail, type BackupInclude } from "@/lib/api";
 import { getStoredAuthKey } from "@/store/auth";
 import { useSettingsStore } from "../store";
@@ -131,7 +130,7 @@ export function BackupSettingsCard() {
         toast.error("当前登录态已失效，请重新登录后再下载");
         return;
       }
-      const response = await fetch(`${webConfig.apiUrl.replace(/\/$/, "")}${getBackupDownloadUrl(key)}`, {
+      const response = await fetch(getBackupDownloadUrl(key), {
         headers: {
           Authorization: `Bearer ${authKey}`,
         },

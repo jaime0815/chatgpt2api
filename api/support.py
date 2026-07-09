@@ -47,7 +47,10 @@ def require_admin(authorization: str | None) -> dict[str, object]:
 
 
 def resolve_image_base_url(request: Request) -> str:
-    return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    if config.base_url:
+        return config.base_url
+    base = f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    return f"{base}{config.web_base_path}" if config.web_base_path else base
 
 
 def raise_image_quota_error(exc: Exception) -> None:
@@ -114,10 +117,22 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     return thread
 
 
+def normalize_web_asset_path(requested_path: str) -> str:
+    clean_path = requested_path.strip("/")
+    base_path = config.web_base_path.strip("/")
+    if not base_path:
+        return clean_path
+    if clean_path == base_path:
+        return ""
+    if clean_path.startswith(f"{base_path}/"):
+        return clean_path[len(base_path) + 1:]
+    return clean_path
+
+
 def resolve_web_asset(requested_path: str) -> Path | None:
     if not WEB_DIST_DIR.exists():
         return None
-    clean_path = requested_path.strip("/")
+    clean_path = normalize_web_asset_path(requested_path)
     base_dir = WEB_DIST_DIR.resolve()
     candidates = [base_dir / "index.html"] if not clean_path else [
         base_dir / Path(clean_path),

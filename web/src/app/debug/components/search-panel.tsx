@@ -5,6 +5,7 @@ import { ExternalLink, Globe2, LoaderCircle, Search } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { withBasePath } from "@/lib/paths";
 import { httpRequest } from "@/lib/request";
 import { cn } from "@/lib/utils";
 
@@ -104,7 +105,7 @@ export function SearchPanel() {
             void runSearch();
           }}
         >
-          <img src="/openai.svg" alt="" aria-hidden="true" className="size-5 shrink-0 opacity-80 dark:invert" />
+          <img src={withBasePath("/openai.svg")} alt="" aria-hidden="true" className="size-5 shrink-0 opacity-80 dark:invert" />
           <input
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
@@ -149,7 +150,7 @@ export function SearchPanel() {
                     return (
                       <a key={`${url || index}`} href={url} target="_blank" rel="noreferrer" className="flex gap-3 py-3 text-xs transition hover:text-stone-950 dark:hover:text-stone-50">
                         <span className="mt-0.5 flex size-5 shrink-0 items-center justify-center text-stone-600 dark:text-stone-300">
-                          {kind === "github" ? <img src="/github.svg" alt="" aria-hidden="true" className="size-3.5 dark:invert" /> : <Globe2 className="size-3.5" />}
+                          {kind === "github" ? <img src={withBasePath("/github.svg")} alt="" aria-hidden="true" className="size-3.5 dark:invert" /> : <Globe2 className="size-3.5" />}
                         </span>
                         <span className="min-w-0">
                           <span className="line-clamp-2 font-medium leading-5 text-stone-800 dark:text-stone-200">{source.title || url || "source"}</span>

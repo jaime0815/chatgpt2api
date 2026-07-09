@@ -539,6 +539,18 @@ class ConfigStore:
         ).strip().rstrip("/")
 
     @property
+    def web_base_path(self) -> str:
+        value = str(
+            os.getenv("CHATGPT2API_WEB_BASE_PATH")
+            or os.getenv("NEXT_PUBLIC_BASE_PATH")
+            or self.data.get("web_base_path")
+            or ""
+        ).strip()
+        if not value or value == "/":
+            return ""
+        return f"/{value.strip('/')}"
+
+    @property
     def app_version(self) -> str:
         try:
             value = VERSION_FILE.read_text(encoding="utf-8").strip()

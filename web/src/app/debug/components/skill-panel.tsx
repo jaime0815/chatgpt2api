@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import webConfig from "@/constants/common-env";
 import { fetchSettingsConfig } from "@/lib/api";
+import { getApiBaseUrl } from "@/lib/paths";
 import { getStoredAuthSession } from "@/store/auth";
 
 export function SkillPanel() {
@@ -15,12 +16,12 @@ export function SkillPanel() {
   const [authKey, setAuthKey] = useState("");
 
   useEffect(() => {
-    setBrowserBaseUrl(window.location.origin);
+    setBrowserBaseUrl(getApiBaseUrl(window.location.origin));
     void fetchSettingsConfig().then((data) => setConfiguredBaseUrl(String(data.config.base_url || "").replace(/\/$/, ""))).catch(() => undefined);
     void getStoredAuthSession().then((session) => setAuthKey(session?.key || ""));
   }, []);
 
-  const apiBaseUrl = configuredBaseUrl || webConfig.apiUrl.replace(/\/$/, "") || browserBaseUrl;
+  const apiBaseUrl = configuredBaseUrl || webConfig.apiUrl || browserBaseUrl;
   const skillZh = useMemo(() => `---
 name: chatgpt2api-search
 description: 当用户需要联网搜索、查询最新信息、核实事实或需要来源链接时，调用本地 chatgpt2api 搜索接口。

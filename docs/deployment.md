@@ -150,6 +150,29 @@ bun install
 bun run dev
 ```
 
+### 子路径 / nginx 前缀部署
+
+如果需要通过 nginx 把前端和同源 API 放在同一个子路径下，例如 `https://example.com/chatgpt2api/`，构建前设置：
+
+```bash
+NEXT_PUBLIC_BASE_PATH=/chatgpt2api
+```
+
+源码构建前端：
+
+```bash
+cd web
+NEXT_PUBLIC_BASE_PATH=/chatgpt2api bun run build
+```
+
+Docker 本地构建：
+
+```bash
+NEXT_PUBLIC_BASE_PATH=/chatgpt2api docker compose -f docker-compose.local.yml up -d --build
+```
+
+`NEXT_PUBLIC_BASE_PATH` 会写入 Next.js `basePath`，并让 public 图标、同源 `/api`、`/v1` 请求以及后端静态文件服务使用同一前缀。使用预构建镜像时，前端静态资源已经编译完成；如需子路径部署，请自构建镜像。
+
 源码方式运行时，后端默认读取项目根目录的 `config.json` 和 `data/`。
 
 ## 存储后端

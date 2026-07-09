@@ -1,6 +1,6 @@
 import axios, {AxiosError, type AxiosRequestConfig} from "axios";
 
-import webConfig from "@/constants/common-env";
+import { getApiBaseUrl, withBasePath } from "@/lib/paths";
 import {clearStoredAuthSession, getStoredAuthKey} from "@/store/auth";
 
 type RequestConfig = AxiosRequestConfig & {
@@ -29,7 +29,7 @@ function errorMessageFromValue(value: unknown): string {
 }
 
 export const request = axios.create({
-    baseURL: webConfig.apiUrl.replace(/\/$/, ""),
+    baseURL: getApiBaseUrl(),
 });
 
 request.interceptors.request.use(async (config) => {
@@ -51,10 +51,11 @@ request.interceptors.response.use(
         const status = error.response?.status;
         const shouldRedirect = (error.config as RequestConfig | undefined)?.redirectOnUnauthorized !== false;
         if (status === 401 && shouldRedirect && typeof window !== "undefined") {
-            // Avoid redirect loop — only redirect if not already on /login
-            if (!window.location.pathname.startsWith("/login")) {
+            const loginPath = withBasePath("/login");
+            // Avoid redirect loop when the app is mounted under a base path.
+            if (!window.location.pathname.startsWith(loginPath)) {
                 await clearStoredAuthSession();
-                window.location.replace("/login");
+                window.location.replace(loginPath);
                 // Return a never-resolving promise to prevent further error handling
                 // while the browser navigates away
                 return new Promise(() => {});

@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 
 from api import accounts, ai, image_tasks, system
 from api.errors import install_exception_handlers
-from api.support import resolve_web_asset, start_limited_account_watcher
+from api.support import normalize_web_asset_path, resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
@@ -42,17 +42,24 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.include_router(ai.create_router())
-    app.include_router(accounts.create_router())
-    app.include_router(image_tasks.create_router())
-    app.include_router(system.create_router(app_version))
+    routers = [
+        ai.create_router(),
+        accounts.create_router(),
+        image_tasks.create_router(),
+        system.create_router(app_version),
+    ]
+    for router in routers:
+        app.include_router(router)
+    if config.web_base_path:
+        for router in routers:
+            app.include_router(router, prefix=config.web_base_path, include_in_schema=False)
 
     @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     async def serve_web(full_path: str):
         asset = resolve_web_asset(full_path)
         if asset is not None:
             return FileResponse(asset)
-        if full_path.strip("/").startswith("_next/"):
+        if normalize_web_asset_path(full_path).startswith("_next/"):
             raise HTTPException(status_code=404, detail="Not Found")
         fallback = resolve_web_asset("")
         if fallback is None:

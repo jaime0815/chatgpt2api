@@ -1,3 +1,4 @@
+import { withApiBasePath } from "@/lib/paths";
 import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
@@ -576,7 +577,7 @@ export async function fetchBackupDetail(key: string) {
 export function getBackupDownloadUrl(key: string) {
   const params = new URLSearchParams();
   params.set("key", key);
-  return `/api/backups/download?${params.toString()}`;
+  return withApiBasePath(`/api/backups/download?${params.toString()}`);
 }
 
 export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }) {

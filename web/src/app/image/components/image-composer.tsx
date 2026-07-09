@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { ImageModel } from "@/lib/api";
+import { withBasePath } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 
 type ImageComposerProps = {
@@ -366,7 +367,7 @@ export function ImageComposer({
                             <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white text-sm shadow-none">
                               <div className="flex min-w-0 items-center gap-2">
                                 <img
-                                  src="/openai.svg"
+                                  src={withBasePath("/openai.svg")}
                                   alt=""
                                   aria-hidden="true"
                                   className="size-4 shrink-0 text-stone-700"
@@ -381,7 +382,7 @@ export function ImageComposer({
                                   value={option.value}
                                   className="pl-10"
                                   style={{
-                                    backgroundImage: "url('/openai.svg')",
+                                    backgroundImage: `url('${withBasePath("/openai.svg")}')`,
                                     backgroundRepeat: "no-repeat",
                                     backgroundPosition: "12px center",
                                     backgroundSize: "16px 16px",
