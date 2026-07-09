@@ -58,6 +58,48 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
+    def test_web_base_path_defaults_to_chatgpt2api(self) -> None:
+        module = self.config_module
+        old_web_base_path = module.os.environ.get("CHATGPT2API_WEB_BASE_PATH")
+        old_next_base_path = module.os.environ.get("NEXT_PUBLIC_BASE_PATH")
+        try:
+            module.os.environ.pop("CHATGPT2API_WEB_BASE_PATH", None)
+            module.os.environ.pop("NEXT_PUBLIC_BASE_PATH", None)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                config_file = Path(tmp_dir) / "config.json"
+                config_file.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
+
+                settings = module.ConfigStore(config_file)
+
+                self.assertEqual(settings.web_base_path, "/chatgpt2api")
+        finally:
+            if old_web_base_path is None:
+                module.os.environ.pop("CHATGPT2API_WEB_BASE_PATH", None)
+            else:
+                module.os.environ["CHATGPT2API_WEB_BASE_PATH"] = old_web_base_path
+            if old_next_base_path is None:
+                module.os.environ.pop("NEXT_PUBLIC_BASE_PATH", None)
+            else:
+                module.os.environ["NEXT_PUBLIC_BASE_PATH"] = old_next_base_path
+
+    def test_web_base_path_can_be_disabled_explicitly(self) -> None:
+        module = self.config_module
+        old_web_base_path = module.os.environ.get("CHATGPT2API_WEB_BASE_PATH")
+        try:
+            module.os.environ["CHATGPT2API_WEB_BASE_PATH"] = "/"
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                config_file = Path(tmp_dir) / "config.json"
+                config_file.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
+
+                settings = module.ConfigStore(config_file)
+
+                self.assertEqual(settings.web_base_path, "")
+        finally:
+            if old_web_base_path is None:
+                module.os.environ.pop("CHATGPT2API_WEB_BASE_PATH", None)
+            else:
+                module.os.environ["CHATGPT2API_WEB_BASE_PATH"] = old_web_base_path
+
 
 if __name__ == "__main__":
     unittest.main()

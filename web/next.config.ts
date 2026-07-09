@@ -5,6 +5,7 @@ import type { NextConfig } from 'next'
 import { parseChangelog } from './src/lib/release'
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+const defaultBasePath = '/chatgpt2api'
 
 function normalizeBasePath(value: string | undefined) {
     const trimmed = String(value || '').trim()
@@ -25,7 +26,7 @@ function readAppVersion() {
 }
 
 const appVersion = process.env.NEXT_PUBLIC_APP_VERSION || readAppVersion()
-const appBasePath = normalizeBasePath(process.env.NEXT_PUBLIC_BASE_PATH || process.env.CHATGPT2API_WEB_BASE_PATH)
+const appBasePath = normalizeBasePath(process.env.NEXT_PUBLIC_BASE_PATH || process.env.CHATGPT2API_WEB_BASE_PATH || defaultBasePath)
 let appReleases = '[]'
 try {
     appReleases = JSON.stringify(parseChangelog(readFileSync(join(projectRoot, 'CHANGELOG.md'), 'utf-8')))

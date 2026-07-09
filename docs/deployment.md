@@ -47,19 +47,19 @@ environment:
 启动：
 
 ```bash
-docker compose up -d
+docker compose -f docker-compose.local.yml up -d --build
 ```
 
 访问：
 
 ```text
-http://localhost:3000
+http://localhost:8000/chatgpt2api/
 ```
 
 API 基础地址：
 
 ```text
-http://localhost:3000/v1
+http://localhost:8000/chatgpt2api/v1
 ```
 
 查看日志：
@@ -105,7 +105,7 @@ docker compose -f docker-compose.warp.yml up -d --build
 访问：
 
 ```text
-http://localhost:3000
+http://localhost:3000/chatgpt2api/
 ```
 
 FlareSolverr 相关配置可以在后台设置页的 `FlareSolverr` tab 中查看和测试。
@@ -152,26 +152,22 @@ bun run dev
 
 ### 子路径 / nginx 前缀部署
 
-如果需要通过 nginx 把前端和同源 API 放在同一个子路径下，例如 `https://example.com/chatgpt2api/`，构建前设置：
-
-```bash
-NEXT_PUBLIC_BASE_PATH=/chatgpt2api
-```
+前端和同源 API 默认放在 `/chatgpt2api` 子路径下，例如 `https://example.com/chatgpt2api/`。
 
 源码构建前端：
 
 ```bash
 cd web
-NEXT_PUBLIC_BASE_PATH=/chatgpt2api bun run build
+bun run build
 ```
 
 Docker 本地构建：
 
 ```bash
-NEXT_PUBLIC_BASE_PATH=/chatgpt2api docker compose -f docker-compose.local.yml up -d --build
+docker compose -f docker-compose.local.yml up -d --build
 ```
 
-`NEXT_PUBLIC_BASE_PATH` 会写入 Next.js `basePath`，并让 public 图标、同源 `/api`、`/v1` 请求以及后端静态文件服务使用同一前缀。使用预构建镜像时，前端静态资源已经编译完成；如需子路径部署，请自构建镜像。
+默认的 `NEXT_PUBLIC_BASE_PATH` 是 `/chatgpt2api`，会写入 Next.js `basePath`，并让 public 图标、同源 `/api`、`/v1` 请求以及后端静态文件服务使用同一前缀。如果需要改成其他路径，可在构建时覆盖 `NEXT_PUBLIC_BASE_PATH`；使用预构建镜像时，前端静态资源已经编译完成，改路径需要自构建镜像。
 
 源码方式运行时，后端默认读取项目根目录的 `config.json` 和 `data/`。
 

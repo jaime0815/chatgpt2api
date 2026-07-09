@@ -15,6 +15,7 @@ DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+DEFAULT_WEB_BASE_PATH = "/chatgpt2api"
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -544,7 +545,7 @@ class ConfigStore:
             os.getenv("CHATGPT2API_WEB_BASE_PATH")
             or os.getenv("NEXT_PUBLIC_BASE_PATH")
             or self.data.get("web_base_path")
-            or ""
+            or DEFAULT_WEB_BASE_PATH
         ).strip()
         if not value or value == "/":
             return ""

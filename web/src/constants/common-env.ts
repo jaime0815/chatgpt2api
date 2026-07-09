@@ -13,7 +13,7 @@ const webConfig = {
         process.env.NEXT_PUBLIC_API_URL ||
         (process.env.NODE_ENV === 'development' ? 'http://127.0.0.1:8000' : '')
     ).replace(/\/$/, ''),
-    basePath: normalizeBasePath(process.env.NEXT_PUBLIC_BASE_PATH),
+    basePath: normalizeBasePath(process.env.NEXT_PUBLIC_BASE_PATH || '/chatgpt2api'),
     appVersion: process.env.NEXT_PUBLIC_APP_VERSION || '0.0.0',
 }
 

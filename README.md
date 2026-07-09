@@ -22,22 +22,18 @@
 ```bash
 git clone git@github.com:basketikun/chatgpt2api.git
 cd chatgpt2api
-docker compose up -d
+docker compose -f docker-compose.local.yml up -d --build
 ```
 
-启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
+启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.local.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
-- Web 面板：`http://localhost:3000`
-- API 地址：`http://localhost:3000/v1`
+- Web 面板：`http://localhost:8000/chatgpt2api/`
+- API 地址：`http://localhost:8000/chatgpt2api/v1`
 - 数据目录：`./data`
 
-如需把 Web 面板和同源 API 挂到 nginx 子路径下，构建前端时设置 `NEXT_PUBLIC_BASE_PATH`，例如 `/chatgpt2api`。该值会让页面、`/_next` 静态资源、public 图标和同源 `/api`、`/v1` 请求都走同一前缀：
+Web 面板和同源 API 默认挂在 `/chatgpt2api` 子路径下，便于 nginx redirect/反向代理。页面、`/_next` 静态资源、public 图标和同源 `/api`、`/v1` 请求都会走同一前缀：
 
-```bash
-NEXT_PUBLIC_BASE_PATH=/chatgpt2api docker compose -f docker-compose.local.yml up -d --build
-```
-
-预构建镜像的前端静态资源已在镜像构建时确定；子路径部署需要使用带 `NEXT_PUBLIC_BASE_PATH` 的自构建镜像。
+如果需要改成其他路径，可在构建时覆盖 `NEXT_PUBLIC_BASE_PATH`；预构建镜像的前端静态资源已在镜像构建时确定，改路径需要自构建镜像。
 
 ### WARP / FlareSolverr 稳定代理部署
 
@@ -79,10 +75,10 @@ bun install
 bun run dev
 ```
 
-如果前端需要以子路径方式本地构建或部署：
+前端默认以 `/chatgpt2api` 子路径方式构建：
 
 ```bash
-NEXT_PUBLIC_BASE_PATH=/chatgpt2api bun run build
+bun run build
 ```
 
 后续更新新版本：
