@@ -41,7 +41,7 @@ export type ChatStreamRequest = {
   model: string
   messages: ChatRequestMessage[]
   attachments: ChatAttachmentManifest[]
-  reasoning_effort?: string
+  thinking_effort?: string
 }
 
 export type ChatStreamEvent =

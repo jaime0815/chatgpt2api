@@ -80,7 +80,7 @@ function request(attachments: PreparedChatAttachment[] = []): ChatStreamRequest 
       },
     ],
     attachments: attachments.map(manifest),
-    reasoning_effort: "high",
+    thinking_effort: "high",
   }
 }
 
@@ -189,7 +189,10 @@ describe("streamChat", () => {
 
     const formData = init.body as FormData
     expect(Array.from(formData.keys())).toEqual(["request", "files", "files"])
-    expect(JSON.parse(String(formData.get("request")))).toEqual(streamRequest)
+    const serializedRequest = JSON.parse(String(formData.get("request")))
+    expect(serializedRequest).toEqual(streamRequest)
+    expect(serializedRequest).toMatchObject({ thinking_effort: "high" })
+    expect(serializedRequest).not.toHaveProperty("reasoning_effort")
     expect(formData.getAll("files").map((entry) => (entry as File).name)).toEqual([
       "second.txt",
       "first.txt",
