@@ -12,30 +12,51 @@ export const MAX_CHAT_WORKING_SET_BYTES = 100 * MIB
 type SupportedAttachmentType = {
   mimeType: string
   kind: ChatAttachmentKind
+  acceptedMimeTypes: readonly string[]
 }
 
 const SUPPORTED_ATTACHMENT_TYPES: Readonly<Record<string, SupportedAttachmentType>> = {
-  png: { mimeType: "image/png", kind: "image" },
-  jpeg: { mimeType: "image/jpeg", kind: "image" },
-  jpg: { mimeType: "image/jpeg", kind: "image" },
-  webp: { mimeType: "image/webp", kind: "image" },
-  gif: { mimeType: "image/gif", kind: "image" },
-  pdf: { mimeType: "application/pdf", kind: "document" },
+  png: { mimeType: "image/png", kind: "image", acceptedMimeTypes: ["image/png"] },
+  jpeg: { mimeType: "image/jpeg", kind: "image", acceptedMimeTypes: ["image/jpeg"] },
+  jpg: { mimeType: "image/jpeg", kind: "image", acceptedMimeTypes: ["image/jpeg"] },
+  webp: { mimeType: "image/webp", kind: "image", acceptedMimeTypes: ["image/webp"] },
+  gif: { mimeType: "image/gif", kind: "image", acceptedMimeTypes: ["image/gif"] },
+  pdf: { mimeType: "application/pdf", kind: "document", acceptedMimeTypes: ["application/pdf"] },
   docx: {
     mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     kind: "document",
+    acceptedMimeTypes: [
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/octet-stream",
+    ],
   },
   xlsx: {
     mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     kind: "document",
+    acceptedMimeTypes: [
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/octet-stream",
+    ],
   },
   pptx: {
     mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     kind: "document",
+    acceptedMimeTypes: [
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "application/octet-stream",
+    ],
   },
-  txt: { mimeType: "text/plain", kind: "document" },
-  md: { mimeType: "text/markdown", kind: "document" },
-  csv: { mimeType: "text/csv", kind: "document" },
+  txt: { mimeType: "text/plain", kind: "document", acceptedMimeTypes: ["text/plain"] },
+  md: {
+    mimeType: "text/markdown",
+    kind: "document",
+    acceptedMimeTypes: ["text/markdown", "text/plain"],
+  },
+  csv: {
+    mimeType: "text/csv",
+    kind: "document",
+    acceptedMimeTypes: ["text/csv", "text/plain", "application/vnd.ms-excel"],
+  },
 }
 
 export type ChatAttachmentValidationCode =
@@ -48,6 +69,7 @@ export type ChatAttachmentValidationCode =
   | "message_too_large"
   | "working_set_too_large"
   | "document_in_image_mode"
+  | "hash_unavailable"
 
 export class ChatAttachmentValidationError extends Error {
   readonly code: ChatAttachmentValidationCode
@@ -69,7 +91,12 @@ function extensionOf(fileName: string) {
   return match?.[1] || ""
 }
 
-function supportedTypeFor(file: File) {
+type InspectedChatFile = {
+  file: File
+  supportedType: SupportedAttachmentType
+}
+
+function inspectChatFile(file: File): InspectedChatFile {
   const extension = extensionOf(file.name)
   const supportedType = SUPPORTED_ATTACHMENT_TYPES[extension]
   if (!supportedType) {
@@ -77,14 +104,15 @@ function supportedTypeFor(file: File) {
   }
 
   const browserMimeType = String(file.type || "").trim().toLowerCase()
-  if (browserMimeType && browserMimeType !== supportedType.mimeType) {
+  if (browserMimeType && !supportedType.acceptedMimeTypes.includes(browserMimeType)) {
     throw new ChatAttachmentValidationError(
       "mime_mismatch",
       `附件 MIME 与扩展名不匹配：${file.name}`,
     )
   }
 
-  return supportedType
+  validateAttachmentSize(supportedType.kind, file.size, file.name)
+  return { file, supportedType }
 }
 
 async function readBlobBuffer(blob: Blob) {
@@ -98,14 +126,6 @@ async function readBlobBuffer(blob: Blob) {
     reader.onerror = () => reject(reader.error || new Error("读取附件失败"))
     reader.readAsArrayBuffer(blob)
   })
-}
-
-async function readBlobBytes(blob: Blob) {
-  const buffer = await readBlobBuffer(blob)
-  const source = new Uint8Array(buffer)
-  const bytes = new Uint8Array(source.byteLength)
-  bytes.set(source)
-  return bytes
 }
 
 function hexDigest(bytes: ArrayBuffer) {
@@ -134,6 +154,65 @@ function validateAttachmentSize(kind: ChatAttachmentKind, size: number, name: st
   }
   if (kind === "document" && size > MAX_CHAT_DOCUMENT_BYTES) {
     throw new ChatAttachmentValidationError("document_too_large", `单个文档不能超过 25 MB：${name}`)
+  }
+}
+
+function validateFileMetadataBatch(
+  inspectedFiles: readonly InspectedChatFile[],
+  options: ChatAttachmentValidationOptions,
+) {
+  const imageCount = inspectedFiles.filter(({ supportedType }) => supportedType.kind === "image").length
+  const documentCount = inspectedFiles.length - imageCount
+
+  if (imageCount > MAX_CHAT_IMAGES) {
+    throw new ChatAttachmentValidationError("too_many_images", `单条消息最多添加 ${MAX_CHAT_IMAGES} 张图片`)
+  }
+  if (documentCount > MAX_CHAT_DOCUMENTS) {
+    throw new ChatAttachmentValidationError(
+      "too_many_documents",
+      `单条消息最多添加 ${MAX_CHAT_DOCUMENTS} 个文档`,
+    )
+  }
+  if (options.mode === "image" && documentCount > 0) {
+    throw new ChatAttachmentValidationError("document_in_image_mode", "生成图片模式不能添加文档附件")
+  }
+
+  const totalBytes = inspectedFiles.reduce((total, { file }) => total + file.size, 0)
+  if (totalBytes > MAX_CHAT_MESSAGE_ATTACHMENT_BYTES) {
+    throw new ChatAttachmentValidationError("message_too_large", "单条消息新增附件总量不能超过 50 MB")
+  }
+}
+
+function getSubtleCrypto() {
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle || typeof subtle.digest !== "function") {
+    throw new ChatAttachmentValidationError(
+      "hash_unavailable",
+      "当前浏览器不支持附件 SHA-256 校验，请升级浏览器后重试",
+    )
+  }
+  return subtle
+}
+
+async function prepareInspectedChatAttachment(
+  inspected: InspectedChatFile,
+  subtle: SubtleCrypto,
+): Promise<PreparedChatAttachment> {
+  const { file, supportedType } = inspected
+  const buffer = await readBlobBuffer(file)
+  const digest = await subtle.digest("SHA-256", new Uint8Array(buffer))
+  const sha256 = hexDigest(digest)
+  return {
+    id: sha256,
+    name: file.name,
+    mimeType: supportedType.mimeType,
+    size: file.size,
+    sha256,
+    kind: supportedType.kind,
+    blob:
+      file.type === supportedType.mimeType
+        ? file
+        : file.slice(0, file.size, supportedType.mimeType),
   }
 }
 
@@ -182,29 +261,20 @@ export function validateChatAttachments(
 }
 
 export async function prepareChatAttachment(file: File): Promise<PreparedChatAttachment> {
-  const supportedType = supportedTypeFor(file)
-  validateAttachmentSize(supportedType.kind, file.size, file.name)
-  const bytes = await readBlobBytes(file)
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes)
-  const sha256 = hexDigest(digest)
-  const attachment: PreparedChatAttachment = {
-    id: sha256,
-    name: file.name,
-    mimeType: supportedType.mimeType,
-    size: file.size,
-    sha256,
-    kind: supportedType.kind,
-    blob: new Blob([bytes], { type: supportedType.mimeType }),
-  }
-
-  validateChatAttachments([attachment])
-  return attachment
+  const inspected = inspectChatFile(file)
+  return prepareInspectedChatAttachment(inspected, getSubtleCrypto())
 }
 
 export async function prepareChatAttachments(
   files: readonly File[],
   options: ChatAttachmentValidationOptions = {},
 ) {
-  const attachments = await Promise.all(files.map((file) => prepareChatAttachment(file)))
+  const inspectedFiles = files.map(inspectChatFile)
+  validateFileMetadataBatch(inspectedFiles, options)
+  const subtle = getSubtleCrypto()
+  const attachments: PreparedChatAttachment[] = []
+  for (const inspected of inspectedFiles) {
+    attachments.push(await prepareInspectedChatAttachment(inspected, subtle))
+  }
   return validateChatAttachments(attachments, options)
 }

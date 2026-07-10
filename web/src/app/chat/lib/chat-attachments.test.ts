@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { PreparedChatAttachment } from "./chat-types"
 import {
   prepareChatAttachment,
+  prepareChatAttachments,
   uniqueAttachmentBytes,
   validateChatAttachments,
 } from "./chat-attachments"
@@ -64,6 +65,41 @@ describe("prepareChatAttachment", () => {
     expect(attachment.blob.type).toBe("image/jpeg")
   })
 
+  it.each([
+    ["notes.md", "text/plain", "text/markdown"],
+    ["notes.md", "text/markdown", "text/markdown"],
+    ["data.csv", "text/plain", "text/csv"],
+    ["data.csv", "text/csv", "text/csv"],
+    ["data.csv", "application/vnd.ms-excel", "text/csv"],
+    ["document.docx", "application/octet-stream", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+    ["sheet.xlsx", "application/octet-stream", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+    ["slides.pptx", "application/octet-stream", "application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+  ])("normalizes trusted browser MIME %s (%s)", async (name, browserMime, canonicalMime) => {
+    const attachment = await prepareChatAttachment(
+      new File(["content"], name, { type: browserMime }),
+    )
+
+    expect(attachment.mimeType).toBe(canonicalMime)
+    expect(attachment.blob.type).toBe(canonicalMime)
+  })
+
+  it.each(["sample.png", "sample.pdf", "sample.txt", "sample.csv"])(
+    "rejects application/octet-stream for unrelated extension %s",
+    async (name) => {
+      await expect(
+        prepareChatAttachment(new File(["content"], name, { type: "application/octet-stream" })),
+      ).rejects.toMatchObject({ code: "mime_mismatch" })
+    },
+  )
+
+  it("keeps the original File when its MIME is already canonical", async () => {
+    const file = new File(["content"], "sample.pdf", { type: "application/pdf" })
+
+    const attachment = await prepareChatAttachment(file)
+
+    expect(attachment.blob).toBe(file)
+  })
+
   it("rejects an oversized file before reading or hashing its bytes", async () => {
     const file = new File([], "large.png", { type: "image/png" })
     const arrayBuffer = vi.fn().mockRejectedValue(new Error("file bytes should not be read"))
@@ -73,6 +109,19 @@ describe("prepareChatAttachment", () => {
     })
 
     await expect(prepareChatAttachment(file)).rejects.toMatchObject({ code: "image_too_large" })
+    expect(arrayBuffer).not.toHaveBeenCalled()
+  })
+
+  it("reports an actionable error before reading when WebCrypto SHA-256 is unavailable", async () => {
+    const file = new File(["content"], "sample.pdf", { type: "application/pdf" })
+    const arrayBuffer = vi.fn().mockResolvedValue(new ArrayBuffer(0))
+    Object.defineProperty(file, "arrayBuffer", { value: arrayBuffer })
+    vi.stubGlobal("crypto", {})
+
+    await expect(prepareChatAttachment(file)).rejects.toMatchObject({
+      code: "hash_unavailable",
+      message: "当前浏览器不支持附件 SHA-256 校验，请升级浏览器后重试",
+    })
     expect(arrayBuffer).not.toHaveBeenCalled()
   })
 
@@ -90,6 +139,25 @@ describe("prepareChatAttachment", () => {
     await expect(prepareChatAttachment(new File(["legacy"], name, { type: mimeType }))).rejects.toThrow(
       "不支持",
     )
+  })
+})
+
+describe("prepareChatAttachments", () => {
+  it("rejects a metadata total over 50 MiB without reading any file", async () => {
+    const reads: ReturnType<typeof vi.fn>[] = []
+    const files = Array.from({ length: 3 }, (_, index) => {
+      const file = new File([], `document-${index}.pdf`, { type: "application/pdf" })
+      const arrayBuffer = vi.fn().mockResolvedValue(Uint8Array.of(index).buffer)
+      Object.defineProperties(file, {
+        size: { value: 20 * MIB },
+        arrayBuffer: { value: arrayBuffer },
+      })
+      reads.push(arrayBuffer)
+      return file
+    })
+
+    await expect(prepareChatAttachments(files)).rejects.toMatchObject({ code: "message_too_large" })
+    reads.forEach((read) => expect(read).not.toHaveBeenCalled())
   })
 })
 

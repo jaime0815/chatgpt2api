@@ -132,6 +132,25 @@ describe("parseChatSse", () => {
       { type: "error", message: "聊天流意外中断", code: "stream_interrupted" },
     ])
   })
+
+  it("cancels the underlying reader when the consumer stops early", async () => {
+    const cancel = vi.fn()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(delta("partial")))
+      },
+      cancel,
+    })
+    const events = parseChatSse(stream)
+
+    await expect(events.next()).resolves.toEqual({
+      value: { type: "delta", content: "partial" },
+      done: false,
+    })
+    await events.return(undefined)
+
+    expect(cancel).toHaveBeenCalledOnce()
+  })
 })
 
 describe("streamChat", () => {
@@ -175,6 +194,35 @@ describe("streamChat", () => {
       "second.txt",
       "first.txt",
     ])
+  })
+
+  it("aborts an active response stream through the provided AbortSignal", async () => {
+    const abortController = new AbortController()
+    const fetchMock = vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      const signal = init.signal as AbortSignal
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(delta("partial")))
+          signal.addEventListener(
+            "abort",
+            () => controller.error(new DOMException("The operation was aborted", "AbortError")),
+            { once: true },
+          )
+        },
+      })
+      return Promise.resolve(new Response(body, { status: 200 }))
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const events = streamChat(request(), [], abortController.signal)
+
+    await expect(events.next()).resolves.toEqual({
+      value: { type: "delta", content: "partial" },
+      done: false,
+    })
+    abortController.abort()
+
+    await expect(events.next()).rejects.toMatchObject({ name: "AbortError" })
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 
   it("rejects a missing or extra prepared file before fetch", async () => {
