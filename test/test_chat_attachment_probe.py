@@ -27,6 +27,7 @@ def _walk_strings(value: Any) -> list[str]:
     return [value] if isinstance(value, str) else []
 
 
+@pytest.mark.skipif(not FIXTURE.exists(), reason="requires a sanitized live PDF probe fixture")
 def test_pdf_fixture_contains_complete_native_attachment_contract() -> None:
     fixture = _load_fixture()
 
@@ -80,6 +81,7 @@ def test_pdf_fixture_contains_complete_native_attachment_contract() -> None:
     assert fixture["processing"]["response"]["done"] is True
 
 
+@pytest.mark.skipif(not FIXTURE.exists(), reason="requires a sanitized live PDF probe fixture")
 def test_pdf_fixture_contains_no_credentials_or_live_signed_urls() -> None:
     strings = _walk_strings(_load_fixture())
     joined = "\n".join(strings)
