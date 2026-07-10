@@ -78,7 +78,11 @@ def _upstream_messages(
 def _is_invalid_token_exception(exc: Exception, *, allow_message_match: bool) -> bool:
     if isinstance(exc, InvalidAccessTokenError):
         return True
-    return allow_message_match and is_token_invalid_error(str(exc or ""))
+    if not allow_message_match:
+        return False
+    if getattr(exc, "status_code", None) == 401:
+        return True
+    return is_token_invalid_error(str(exc or ""))
 
 
 class _LinearizedChunkIterator:

@@ -18,6 +18,7 @@ from services import chat_stream_service, openai_backend_api
 from services.chat_stream_service import ChatStreamSession
 from services.chat_types import ChatAttachmentBlob, ChatMessage, ChatStreamCommand
 from services.openai_backend_api import InvalidAccessTokenError
+from utils.helper import UpstreamHTTPError
 
 
 def _delta(text: str) -> str:
@@ -207,6 +208,58 @@ class SilentSSEServer:
         self._thread.join(timeout=1)
 
 
+class TokenSwitchSSEServer:
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:
+                content_length = int(self.headers.get("Content-Length") or 0)
+                if content_length:
+                    self.rfile.read(content_length)
+                token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+                owner.tokens.append(token)
+                if token == "token-a":
+                    body = b'{"detail":"unauthorized"}'
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for payload in (_delta("replacement answer"), "[DONE]"):
+                    body = f"data: {payload}\n\n".encode()
+                    self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+
+            def log_message(self, _format: str, *args: Any) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_port}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=1)
+
+
 def _attachment(attachment_id: str = "attachment-1") -> ChatAttachmentBlob:
     return ChatAttachmentBlob(
         id=attachment_id,
@@ -389,6 +442,30 @@ def test_local_uploader_token_text_does_not_retry_healthy_account() -> None:
             attachment_uploader=FakeAttachmentUploader(error=local_error),
         ))
 
+    assert len(factory.backends) == 1
+    assert accounts.refresh_calls == []
+    assert accounts.remove_calls == []
+    assert accounts.get_calls == [set()]
+    assert factory.backends[0].close_calls == 1
+
+
+def test_structured_401_from_attachment_uploader_does_not_retry_account() -> None:
+    upload_error = UpstreamHTTPError("attachment upload", 401, {"detail": "local failure"})
+    factory = BackendFactory({
+        "token-a": [TrackingIterator([])],
+        "token-b": [TrackingIterator([])],
+    })
+    accounts = FakeAccountProvider(["token-a", "token-b"])
+
+    with pytest.raises(UpstreamHTTPError) as captured:
+        list(ChatStreamSession(
+            _command(),
+            account_provider=accounts,
+            backend_factory=factory,
+            attachment_uploader=FakeAttachmentUploader(error=upload_error),
+        ))
+
+    assert captured.value is upload_error
     assert len(factory.backends) == 1
     assert accounts.refresh_calls == []
     assert accounts.remove_calls == []
@@ -820,6 +897,62 @@ def test_session_cancel_interrupts_real_silent_sse_without_server_release(
     finally:
         session.close()
         server.close()
+
+
+def test_real_conversation_401_retries_with_replacement_account_and_reuploads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = TokenSwitchSSEServer()
+    accounts = FakeAccountProvider(["token-a", "token-b"])
+    uploader = FakeAttachmentUploader()
+    backends: list[openai_backend_api.OpenAIBackendAPI] = []
+
+    def direct_session_kwargs(**kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("account", None)
+        return kwargs
+
+    def backend_factory(token: str) -> openai_backend_api.OpenAIBackendAPI:
+        backend = openai_backend_api.OpenAIBackendAPI(token)
+        backend.base_url = server.base_url
+        monkeypatch.setattr(backend, "_bootstrap", lambda: None)
+        monkeypatch.setattr(
+            backend,
+            "_get_chat_requirements",
+            lambda: openai_backend_api.ChatRequirements("requirements-token"),
+        )
+        monkeypatch.setattr(backend, "_chat_target", lambda: ("/stream", "UTC"))
+        monkeypatch.setattr(backend, "_conversation_payload", lambda *_args, **_kwargs: {})
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(
+        openai_backend_api.proxy_settings,
+        "build_session_kwargs",
+        direct_session_kwargs,
+    )
+
+    try:
+        chunks = list(ChatStreamSession(
+            _command(),
+            account_provider=accounts,
+            backend_factory=backend_factory,
+            attachment_uploader=uploader,
+        ))
+    finally:
+        server.close()
+
+    assert _content(chunks) == "replacement answer"
+    assert server.tokens == ["token-a", "token-b"]
+    assert [backend.access_token for backend in backends] == ["token-a", "token-b"]
+    assert [backend.access_token for backend, _attachments in uploader.calls] == [
+        "token-a",
+        "token-b",
+    ]
+    assert uploader.results[0]["attachment-1"] is not uploader.results[1]["attachment-1"]
+    assert accounts.refresh_calls == [("token-a", True, "chat_stream")]
+    assert accounts.remove_calls == [("token-a", "chat_stream")]
+    assert accounts.get_calls == [set(), {"token-a"}]
+    assert accounts.mark_calls == ["token-b"]
 
 
 def test_text_only_success_does_not_require_attachment_uploader() -> None:
