@@ -133,6 +133,7 @@ class ChatStreamSession:
             event_iterator: Any | None = None
             retry = False
             succeeded = False
+            completed = False
             try:
                 backend = self._backend_factory(token)
                 if not self._activate_backend(backend):
@@ -164,6 +165,9 @@ class ChatStreamSession:
                 for event in event_iterator:
                     if self._is_closed():
                         return
+                    if event.get("type") == "conversation.done":
+                        completed = True
+                        break
                     if event.get("type") != "conversation.delta":
                         continue
                     delta = str(event.get("delta") or "")
@@ -183,6 +187,8 @@ class ChatStreamSession:
 
                 if self._is_closed():
                     return
+                if not completed:
+                    raise RuntimeError("upstream chat stream was truncated before completion")
                 self._account_provider.mark_text_used(token)
                 succeeded = True
             except Exception as exc:

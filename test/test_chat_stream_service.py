@@ -306,6 +306,67 @@ def test_invalid_token_after_first_delta_is_not_replayed() -> None:
     assert factory.backends[0].close_calls == 1
 
 
+def test_empty_stream_eof_is_truncated_without_marking_success() -> None:
+    stream = TrackingIterator([])
+    factory = BackendFactory({"token-a": [stream]})
+    accounts = FakeAccountProvider(["token-a"])
+
+    with pytest.raises(RuntimeError, match="truncated"):
+        list(ChatStreamSession(
+            _command(),
+            account_provider=accounts,
+            backend_factory=factory,
+            attachment_uploader=FakeAttachmentUploader(),
+        ))
+
+    assert accounts.mark_calls == []
+    assert stream.close_calls == 1
+    assert factory.backends[0].close_calls == 1
+
+
+def test_stream_eof_after_delta_raises_without_replay_or_stop() -> None:
+    stream = TrackingIterator([_delta("partial")])
+    factory = BackendFactory({"token-a": [stream]})
+    accounts = FakeAccountProvider(["token-a", "token-b"])
+    iterator = iter(ChatStreamSession(
+        _command(),
+        account_provider=accounts,
+        backend_factory=factory,
+        attachment_uploader=FakeAttachmentUploader(),
+    ))
+
+    first = next(iterator)
+    assert _content([first]) == "partial"
+    with pytest.raises(RuntimeError, match="truncated"):
+        next(iterator)
+
+    assert len(factory.backends) == 1
+    assert accounts.refresh_calls == []
+    assert accounts.remove_calls == []
+    assert accounts.mark_calls == []
+    assert stream.close_calls == 1
+    assert factory.backends[0].close_calls == 1
+
+
+def test_explicit_done_marks_success_and_emits_stop() -> None:
+    stream = TrackingIterator(["[DONE]"])
+    factory = BackendFactory({"token-a": [stream]})
+    accounts = FakeAccountProvider(["token-a"])
+
+    chunks = list(ChatStreamSession(
+        _command(),
+        account_provider=accounts,
+        backend_factory=factory,
+        attachment_uploader=FakeAttachmentUploader(),
+    ))
+
+    assert accounts.mark_calls == ["token-a"]
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert stream.close_calls == 1
+    assert factory.backends[0].close_calls == 1
+
+
 def test_non_token_stream_error_closes_iterator_and_backend_without_stop() -> None:
     stream = TrackingIterator([RuntimeError("upstream failed")])
     factory = BackendFactory({"token-a": [stream]})
