@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import json
 import mimetypes
 import os
+import queue
 import random
 import re
 import threading
@@ -137,6 +139,162 @@ class EditableFileExportResult:
     zip_path: Path
 
 
+@dataclass(frozen=True)
+class _AsyncStreamFailure:
+    error: Exception
+
+
+_ASYNC_STREAM_END = object()
+
+
+class _AsyncConversationResponse:
+    """Bridge one cancellable AsyncSession response into the synchronous API."""
+
+    def __init__(
+            self,
+            *,
+            url: str,
+            headers: Dict[str, str],
+            payload: Dict[str, Any],
+            session_kwargs: Dict[str, Any],
+            timeout: float,
+            context: str,
+    ) -> None:
+        self._url = url
+        self._headers = headers
+        self._payload = payload
+        self._session_kwargs = session_kwargs
+        self._timeout = timeout
+        self._context = context
+
+        self._items: queue.Queue[object] = queue.Queue()
+        self._cancelled = threading.Event()
+        self._finished = threading.Event()
+        self._state_lock = threading.Lock()
+        self._started = False
+        self._terminal_enqueued = False
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._async_session: Any | None = None
+
+    def start(self) -> None:
+        with self._state_lock:
+            if self._started or self._cancelled.is_set():
+                finish_without_thread = self._cancelled.is_set() and not self._started
+                thread = None
+            else:
+                self._started = True
+                finish_without_thread = False
+                thread = threading.Thread(
+                    target=self._run,
+                    name="chat-conversation-stream",
+                    daemon=True,
+                )
+                self._thread = thread
+        if finish_without_thread:
+            self._finish()
+            return
+        if thread is None:
+            return
+        try:
+            thread.start()
+        except Exception:
+            self._finish()
+            raise
+
+    def iter_lines(self) -> Iterator[bytes | str]:
+        self.start()
+        while True:
+            item = self._items.get()
+            if item is _ASYNC_STREAM_END:
+                return
+            if isinstance(item, _AsyncStreamFailure):
+                raise item.error
+            if self._cancelled.is_set():
+                return
+            yield item  # type: ignore[misc]
+
+    def close(self) -> None:
+        self._cancelled.set()
+        with self._state_lock:
+            started = self._started
+            loop = self._loop
+            session = self._async_session
+            thread = self._thread
+        if not started:
+            self._finish()
+            return
+        if loop is not None and session is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._close_async_session(),
+                    loop,
+                )
+            except RuntimeError:
+                pass
+        if thread is not threading.current_thread():
+            self._finished.wait()
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        with self._state_lock:
+            self._loop = loop
+        try:
+            loop.run_until_complete(self._produce())
+        except Exception as exc:
+            if not self._cancelled.is_set():
+                self._items.put(_AsyncStreamFailure(exc))
+        finally:
+            try:
+                loop.run_until_complete(self._close_async_session())
+            except Exception:
+                pass
+            with self._state_lock:
+                self._loop = None
+            loop.close()
+            self._finish()
+
+    async def _produce(self) -> None:
+        session = requests.AsyncSession(**self._session_kwargs)
+        with self._state_lock:
+            self._async_session = session
+        if self._cancelled.is_set():
+            return
+        try:
+            response = await session.post(
+                self._url,
+                headers=self._headers,
+                json=self._payload,
+                timeout=self._timeout,
+                stream=True,
+            )
+            if self._cancelled.is_set():
+                return
+            ensure_ok(response, self._context)
+            async for line in response.aiter_lines():
+                if self._cancelled.is_set():
+                    return
+                self._items.put(line)
+        finally:
+            await self._close_async_session()
+
+    async def _close_async_session(self) -> None:
+        with self._state_lock:
+            session = self._async_session
+            self._async_session = None
+        if session is not None:
+            await session.close()
+
+    def _finish(self) -> None:
+        with self._state_lock:
+            if self._terminal_enqueued:
+                return
+            self._terminal_enqueued = True
+            self._items.put(_ASYNC_STREAM_END)
+            self._finished.set()
+
+
 class OpenAIBackendAPI:
     """ChatGPT Web 后端封装。
 
@@ -171,11 +329,12 @@ class OpenAIBackendAPI:
         self._active_response_lock = threading.Lock()
         self._active_stream_response: Any | None = None
         self._closed = False
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+        self._session_kwargs = proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
-        ))
+        )
+        self.session = requests.Session(**self._session_kwargs)
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -2601,19 +2760,25 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
-        response = self.session.post(
-            self.base_url + path,
+        async_session_kwargs = dict(self._session_kwargs)
+        async_session_kwargs["headers"] = dict(self.session.headers)
+        cookies = getattr(self.session, "cookies", None)
+        if cookies is not None:
+            async_session_kwargs["cookies"] = requests.Cookies(cookies)
+        response = _AsyncConversationResponse(
+            url=self.base_url + path,
             headers=self._conversation_headers(path, requirements),
-            json=payload,
+            payload=payload,
+            session_kwargs=async_session_kwargs,
             timeout=300,
-            stream=True,
+            context=path,
         )
         registered = False
         try:
-            ensure_ok(response, path)
             registered = self._register_active_response(response)
             if not registered:
                 return
+            response.start()
             yield from iter_sse_payloads(response)
         finally:
             if not registered or self._release_active_response(response):

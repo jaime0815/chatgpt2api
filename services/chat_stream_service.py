@@ -81,6 +81,38 @@ def _is_invalid_token_exception(exc: Exception, *, allow_message_match: bool) ->
     return allow_message_match and is_token_invalid_error(str(exc or ""))
 
 
+class _LinearizedChunkIterator:
+    def __init__(
+        self,
+        session: ChatStreamSession,
+        candidates: Iterator[dict[str, Any]],
+    ) -> None:
+        self._session = session
+        self._candidates = candidates
+        self._closed = False
+
+    def __iter__(self) -> _LinearizedChunkIterator:
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        if self._closed:
+            raise StopIteration
+        chunk = next(self._candidates)
+        try:
+            return self._session._deliver_chunk(chunk)
+        except StopIteration:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._candidates, "close", None)
+        if callable(close):
+            close()
+
+
 class ChatStreamSession:
     def __init__(
         self,
@@ -108,6 +140,9 @@ class ChatStreamSession:
         return self.iter_chunks()
 
     def iter_chunks(self) -> Iterator[dict[str, Any]]:
+        return _LinearizedChunkIterator(self, self._iter_candidate_chunks())
+
+    def _iter_candidate_chunks(self) -> Iterator[dict[str, Any]]:
         if not self._begin():
             return
 
@@ -246,8 +281,8 @@ class ChatStreamSession:
         self.close()
 
     def close(self) -> None:
-        self._cancelled.set()
         with self._lock:
+            self._cancelled.set()
             if self._closed:
                 return
             self._closed = True
@@ -273,6 +308,12 @@ class ChatStreamSession:
 
     def _is_closed(self) -> bool:
         return self._cancelled.is_set()
+
+    def _deliver_chunk(self, chunk: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._closed:
+                raise StopIteration
+            return chunk
 
     @staticmethod
     def _cancel_active_response(backend: Any | None) -> None:

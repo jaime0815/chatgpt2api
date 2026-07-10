@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from inspect import getsourcelines
 from typing import Any, Iterable
 
 import pytest
@@ -143,6 +149,62 @@ class FakeAttachmentUploader:
         }
         self.results.append(result)
         return result
+
+
+class SilentSSEServer:
+    def __init__(self, first_payload: str) -> None:
+        self.release = threading.Event()
+        self.client_disconnected = threading.Event()
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:
+                content_length = int(self.headers.get("Content-Length") or 0)
+                if content_length:
+                    self.rfile.read(content_length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                body = f"data: {first_payload}\n\n".encode()
+                self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n")
+                self.wfile.flush()
+
+                self.connection.settimeout(0.05)
+                while not owner.release.is_set():
+                    try:
+                        if self.connection.recv(1, socket.MSG_PEEK) == b"":
+                            owner.client_disconnected.set()
+                            return
+                    except TimeoutError:
+                        continue
+                    except OSError:
+                        owner.client_disconnected.set()
+                        return
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
+
+            def log_message(self, _format: str, *args: Any) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_port}"
+
+    def close(self) -> None:
+        self.release.set()
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=1)
 
 
 def _attachment(attachment_id: str = "attachment-1") -> ChatAttachmentBlob:
@@ -511,6 +573,59 @@ def test_cancel_during_delta_chunk_construction_does_not_yield_chunk(
             result.result(timeout=2)
 
 
+def test_cancel_return_is_linearized_before_candidate_delta_delivery() -> None:
+    entered = threading.Event()
+    released = threading.Event()
+    stream = TrackingIterator([_delta("partial"), "[DONE]"])
+    session = ChatStreamSession(
+        _command(),
+        account_provider=FakeAccountProvider(["token-a"]),
+        backend_factory=BackendFactory({"token-a": [stream]}),
+        attachment_uploader=FakeAttachmentUploader(),
+    )
+    iterator = iter(session)
+    candidate_method = getattr(
+        ChatStreamSession,
+        "_iter_candidate_chunks",
+        ChatStreamSession.iter_chunks,
+    )
+    source_lines, start_line = getsourcelines(candidate_method)
+    yield_lines = {
+        start_line + offset
+        for offset, source_line in enumerate(source_lines)
+        if source_line.strip() == "yield chunk"
+    }
+
+    def traced_next() -> dict[str, Any]:
+        def trace(frame: Any, event: str, _arg: Any) -> Any:
+            if (
+                event == "line"
+                and frame.f_code is candidate_method.__code__
+                and frame.f_lineno in yield_lines
+            ):
+                chunk = frame.f_locals.get("chunk")
+                choices = chunk.get("choices") if isinstance(chunk, dict) else None
+                delta = choices[0].get("delta") if choices else None
+                if isinstance(delta, dict) and delta.get("content") == "partial":
+                    entered.set()
+                    released.wait(timeout=2)
+            return trace
+
+        sys.settrace(trace)
+        try:
+            return next(iterator)
+        finally:
+            sys.settrace(None)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(traced_next)
+        assert entered.wait(timeout=2)
+        session.cancel()
+        released.set()
+        with pytest.raises(StopIteration):
+            result.result(timeout=2)
+
+
 def test_cancel_during_stop_chunk_construction_does_not_yield_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -562,6 +677,13 @@ class BlockingStreamResponse:
         return
         yield b""  # pragma: no cover
 
+    async def aiter_lines(self) -> Any:
+        self.started.set()
+        while not self.released.is_set():
+            await asyncio.sleep(0.01)
+        return
+        yield b""  # pragma: no cover
+
     def close(self) -> None:
         with self._lock:
             if self.closed:
@@ -575,6 +697,7 @@ class FakeCurlSession:
     def __init__(self, response: BlockingStreamResponse) -> None:
         self.response = response
         self.headers: dict[str, str] = {}
+        self.cookies: dict[str, str] = {}
         self.close_calls = 0
 
     def post(self, *_args: Any, **_kwargs: Any) -> BlockingStreamResponse:
@@ -584,12 +707,35 @@ class FakeCurlSession:
         self.close_calls += 1
 
 
+class FakeAsyncCurlSession:
+    def __init__(self, response: BlockingStreamResponse) -> None:
+        self.response = response
+        self.close_calls = 0
+        self._closed = False
+
+    async def post(self, *_args: Any, **_kwargs: Any) -> BlockingStreamResponse:
+        return self.response
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.close_calls += 1
+        self.response.close()
+
+
 def test_session_cancel_closes_active_backend_response_and_releases_blocked_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     response = BlockingStreamResponse()
     fake_session = FakeCurlSession(response)
+    fake_async_session = FakeAsyncCurlSession(response)
     monkeypatch.setattr(openai_backend_api.requests, "Session", lambda **_kwargs: fake_session)
+    monkeypatch.setattr(
+        openai_backend_api.requests,
+        "AsyncSession",
+        lambda **_kwargs: fake_async_session,
+    )
     backend = openai_backend_api.OpenAIBackendAPI()
     monkeypatch.setattr(backend, "_bootstrap", lambda: None)
     monkeypatch.setattr(backend, "_get_chat_requirements", lambda: object())
@@ -617,6 +763,63 @@ def test_session_cancel_closes_active_backend_response_and_releases_blocked_stre
 
     assert response.close_calls == 1
     assert fake_session.close_calls == 1
+    assert fake_async_session.close_calls == 1
+
+
+def test_session_cancel_interrupts_real_silent_sse_without_server_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = SilentSSEServer(_delta("partial"))
+
+    def direct_session_kwargs(**kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("account", None)
+        return kwargs
+
+    monkeypatch.setattr(
+        openai_backend_api.proxy_settings,
+        "build_session_kwargs",
+        direct_session_kwargs,
+    )
+    backend = openai_backend_api.OpenAIBackendAPI()
+    backend.base_url = server.base_url
+    monkeypatch.setattr(backend, "_bootstrap", lambda: None)
+    monkeypatch.setattr(backend, "_get_chat_requirements", lambda: object())
+    monkeypatch.setattr(backend, "_chat_target", lambda: ("/stream", "UTC"))
+    monkeypatch.setattr(backend, "_conversation_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(backend, "_conversation_headers", lambda *_args, **_kwargs: {})
+    session = ChatStreamSession(
+        _command(
+            messages=(ChatMessage("message-1", "user", "Hello", ()),),
+            attachments=(),
+        ),
+        account_provider=FakeAccountProvider(["token-a"]),
+        backend_factory=lambda _token: backend,
+    )
+    iterator = iter(session)
+
+    try:
+        assert _content([next(iterator)]) == "partial"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = pool.submit(next, iterator)
+            time.sleep(0.05)
+            assert not pending.done()
+            cancelled = pool.submit(session.cancel)
+            try:
+                cancelled.result(timeout=0.5)
+                with pytest.raises(StopIteration):
+                    pending.result(timeout=0.5)
+                assert server.client_disconnected.wait(timeout=0.5)
+                assert not server.release.is_set()
+            finally:
+                server.release.set()
+                cancelled.result(timeout=2)
+                try:
+                    pending.result(timeout=2)
+                except StopIteration:
+                    pass
+    finally:
+        session.close()
+        server.close()
 
 
 def test_text_only_success_does_not_require_attachment_uploader() -> None:
