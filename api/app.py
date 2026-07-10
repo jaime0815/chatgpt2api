@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import accounts, ai, image_tasks, system
+from api import accounts, ai, chat, image_tasks, system
 from api.errors import install_exception_handlers
 from api.support import normalize_web_asset_path, resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
@@ -44,6 +44,7 @@ def create_app() -> FastAPI:
     )
     routers = [
         ai.create_router(),
+        chat.create_router(),
         accounts.create_router(),
         image_tasks.create_router(),
         system.create_router(app_version),
