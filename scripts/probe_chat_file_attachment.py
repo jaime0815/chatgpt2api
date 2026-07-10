@@ -185,6 +185,22 @@ PROCESSING_TERMINAL_FAILURES = {
     "canceled",
     "unknown",
 }
+PROCESSING_TERMINAL_SUCCESSES = {
+    "complete",
+    "completed",
+    "finished",
+    "finished_successfully",
+    "metadata",
+    "succeeded",
+    "success",
+}
+CONVERSATION_TERMINAL_SUCCESSES = {
+    "complete",
+    "completed",
+    "finished_successfully",
+    "succeeded",
+    "success",
+}
 
 
 class ProbeBlocked(RuntimeError):
@@ -277,8 +293,13 @@ def _header_subset(headers: Any, names: Iterable[str]) -> dict[str, str]:
     }
 
 
-def _iter_json_stream(response: Any, *, max_captured_events: int = 200) -> list[dict[str, Any]]:
+def _iter_json_stream(
+    response: Any,
+    *,
+    max_captured_events: int = 200,
+) -> tuple[list[dict[str, Any]], bool]:
     events: list[dict[str, Any]] = []
+    done = False
     for raw_line in response.iter_lines():
         line = raw_line.decode("utf-8", "replace") if isinstance(raw_line, bytes) else str(raw_line)
         line = line.strip()
@@ -286,15 +307,18 @@ def _iter_json_stream(response: Any, *, max_captured_events: int = 200) -> list[
             continue
         if line.startswith("data:"):
             line = line[5:].strip()
-        if not line or line == "[DONE]":
+        if not line:
             continue
+        if line == "[DONE]":
+            done = True
+            break
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict) and len(events) < max_captured_events:
             events.append(payload)
-    return events
+    return events, done
 
 
 def _walk_key_values(value: Any, parent_key: str = "") -> Iterable[tuple[str, str, str]]:
@@ -501,11 +525,102 @@ def _processing_state_is_failure(value: Any) -> bool:
     return bool(normalized) and normalized.rsplit(".", 1)[-1] in PROCESSING_TERMINAL_FAILURES
 
 
+def _processing_state_is_success(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return bool(normalized) and normalized.rsplit(".", 1)[-1] in PROCESSING_TERMINAL_SUCCESSES
+
+
 def _processing_event_has_failure(event: Any) -> bool:
     return isinstance(event, dict) and any(
         _processing_state_is_failure(event.get(key))
         for key in ("event", "status")
     )
+
+
+def _processing_event_has_success(event: Any) -> bool:
+    return isinstance(event, dict) and any(
+        _processing_state_is_success(event.get(key))
+        for key in ("event", "status")
+    )
+
+
+def _response_body_has_semantic_failure(value: Any) -> bool:
+    body = _as_dict(value)
+    return _processing_state_is_failure(body.get("status")) or body.get("success") is False
+
+
+def _conversation_event_candidates(event: Any) -> Iterable[dict[str, Any]]:
+    if not isinstance(event, dict):
+        return
+    yield event
+    nested = event.get("v")
+    if isinstance(nested, dict):
+        yield nested
+
+
+def _message_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if not isinstance(content, dict):
+        return ""
+    parts = content.get("parts")
+    if isinstance(parts, list):
+        text = "".join(part for part in parts if isinstance(part, str))
+        if text:
+            return text
+    return str(content.get("text") or "")
+
+
+def _message_terminal_status(message: dict[str, Any]) -> str:
+    metadata = message.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    finish_details = metadata.get("finish_details")
+    finish_details = finish_details if isinstance(finish_details, dict) else {}
+    return str(
+        message.get("status")
+        or finish_details.get("type")
+        or metadata.get("status")
+        or ""
+    ).strip()
+
+
+def _conversation_event_has_failure(event: Any) -> bool:
+    for candidate in _conversation_event_candidates(event):
+        if any(
+            _processing_state_is_failure(candidate.get(key))
+            for key in ("type", "event", "status")
+        ):
+            return True
+        if bool(candidate.get("error")):
+            return True
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        if _processing_state_is_failure(_message_terminal_status(message)):
+            return True
+        if bool(message.get("error")):
+            return True
+    return False
+
+
+def _conversation_successful_assistant_answers(events: list[dict[str, Any]]) -> list[str]:
+    answers: list[str] = []
+    for event in events:
+        for candidate in _conversation_event_candidates(event):
+            message = candidate.get("message")
+            if not isinstance(message, dict):
+                continue
+            role = str((_as_dict(message.get("author"))).get("role") or "").strip().lower()
+            status = _message_terminal_status(message).lower()
+            if role != "assistant" or status not in CONVERSATION_TERMINAL_SUCCESSES:
+                continue
+            if message.get("end_turn") is False:
+                continue
+            answers.append(_message_text(message).strip())
+    return answers
 
 
 def _processing_status(events: list[Any], replacements: dict[str, str]) -> list[dict[str, Any]]:
@@ -529,16 +644,33 @@ def _processing_status(events: list[Any], replacements: dict[str, str]) -> list[
 
 def _event_summary(event: dict[str, Any], replacements: dict[str, str]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    for key in ("type", "event", "status", "conversation_id", "message_id"):
-        value = event.get(key)
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            summary[key] = _sanitize_scalar(value, replacements)
-    message = event.get("message")
-    if isinstance(message, dict):
-        for key in ("id", "status", "recipient"):
-            value = message.get(key)
+    for candidate in _conversation_event_candidates(event):
+        for key in ("type", "event", "status", "conversation_id", "message_id"):
+            if key not in candidate:
+                continue
+            value = candidate[key]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                summary[key] = _sanitize_scalar(value, replacements)
+        if bool(candidate.get("error")):
+            summary["has_error"] = True
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        for key in ("id", "status", "recipient", "end_turn"):
+            if key not in message:
+                continue
+            value = message[key]
             if isinstance(value, (str, int, float, bool)) or value is None:
                 summary[f"message_{key}"] = _sanitize_scalar(value, replacements)
+        role = _as_dict(message.get("author")).get("role")
+        if isinstance(role, str):
+            summary["message_role"] = _redact_string(role, replacements)
+        terminal_status = _message_terminal_status(message)
+        if terminal_status:
+            summary["message_status"] = _redact_string(terminal_status, replacements)
+        message_text = _message_text(message)
+        if message_text:
+            summary["message_text"] = _redact_string(message_text, replacements)
     return summary
 
 
@@ -650,6 +782,7 @@ def build_sanitized_fixture(raw_capture: dict[str, Any]) -> dict[str, Any]:
             "response": {
                 "status_code": processing_response.get("status_code"),
                 "events": projected_processing_events,
+                "done": processing_response.get("done") is True,
             },
         },
         "processing_status": _processing_status(
@@ -673,9 +806,10 @@ def build_sanitized_fixture(raw_capture: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(conversation_response, dict)
                 else None,
                 "event_count": len(conversation_events) if isinstance(conversation_events, list) else 0,
+                "done": conversation_response.get("done") is True,
                 "event_summaries": [
                     _event_summary(event, replacements)
-                    for event in (conversation_events if isinstance(conversation_events, list) else [])[:20]
+                    for event in (conversation_events if isinstance(conversation_events, list) else [])[-20:]
                     if isinstance(event, dict)
                 ],
             },
@@ -941,6 +1075,10 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
         create_response_body["upload_url"] == "<signed-upload-url-redacted>",
         "create_file.response.body.upload_url",
     )
+    _require_fixture(
+        not _response_body_has_semantic_failure(create_response_body),
+        "create_file.response semantic failure",
+    )
     _require_optional_redacted_identifier(
         create_response_body,
         "library_file_id",
@@ -1029,6 +1167,10 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
         "<file-id-redacted>",
         "uploaded_confirmation.response.body",
     )
+    _require_fixture(
+        not _response_body_has_semantic_failure(confirmation_response_body),
+        "uploaded_confirmation.response semantic failure",
+    )
 
     processing = _require_keys(
         root["processing"],
@@ -1064,12 +1206,16 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
     )
     processing_response = _require_keys(
         processing["response"],
-        allowed={"status_code", "events"},
-        required={"status_code", "events"},
+        allowed={"status_code", "events", "done"},
+        required={"status_code", "events", "done"},
         path="processing.response",
     )
     _require_fixture(processing_response["status_code"] in {200, 201}, "processing.response.status_code")
     _require_fixture(isinstance(processing_response["events"], list), "processing.response.events")
+    _require_fixture(
+        processing_response["done"] is True,
+        "processing.response complete marker",
+    )
     for index, event in enumerate(processing_response["events"]):
         event_mapping = _require_keys(
             event,
@@ -1094,6 +1240,10 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
                 "<library-file-id-redacted>",
                 f"processing.response.events[{index}].extra",
             )
+    _require_fixture(
+        any(_processing_event_has_success(event) for event in processing_response["events"]),
+        "processing.response successful terminal",
+    )
 
     processing_status = root["processing_status"]
     _require_fixture(isinstance(processing_status, list) and bool(processing_status), "processing_status")
@@ -1162,16 +1312,21 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
     )
     conversation_response = _require_keys(
         conversation["response"],
-        allowed={"status_code", "event_count", "event_summaries"},
-        required={"status_code", "event_count", "event_summaries"},
+        allowed={"status_code", "event_count", "event_summaries", "done"},
+        required={"status_code", "event_count", "event_summaries", "done"},
         path="conversation.response",
     )
     _require_fixture(conversation_response["status_code"] in {200, 201}, "conversation.response.status_code")
+    _require_fixture(
+        conversation_response["done"] is True,
+        "conversation.response complete marker",
+    )
     _require_fixture(
         isinstance(conversation_response["event_count"], int) and conversation_response["event_count"] > 0,
         "conversation.response.event_count",
     )
     _require_fixture(isinstance(conversation_response["event_summaries"], list), "conversation.response.event_summaries")
+    successful_answers: list[str] = []
     for index, summary in enumerate(conversation_response["event_summaries"]):
         summary_mapping = _require_keys(
             summary,
@@ -1183,6 +1338,10 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
                 "message_id",
                 "message_status",
                 "message_recipient",
+                "message_role",
+                "message_end_turn",
+                "message_text",
+                "has_error",
             },
             required=set(),
             path=f"conversation.response.event_summaries[{index}]",
@@ -1199,6 +1358,28 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
             "<message-id-redacted>",
             f"conversation.response.event_summaries[{index}]",
         )
+        if summary_mapping.get("has_error") is True or any(
+            _processing_state_is_failure(summary_mapping.get(key))
+            for key in ("type", "event", "status", "message_status")
+        ):
+            raise ProbeFailed(
+                "sanitized fixture conversation contains terminal failure"
+            )
+        if (
+            str(summary_mapping.get("message_role") or "").strip().lower() == "assistant"
+            and str(summary_mapping.get("message_status") or "").strip().lower()
+            in CONVERSATION_TERMINAL_SUCCESSES
+            and summary_mapping.get("message_end_turn") is not False
+        ):
+            successful_answers.append(str(summary_mapping.get("message_text") or "").strip())
+    _require_fixture(
+        bool(successful_answers),
+        "conversation.response successful assistant terminal",
+    )
+    _require_fixture(
+        successful_answers[-1] == PROBE_FILE_NAME,
+        "conversation.response probe answer",
+    )
 
 
 def _processing_metadata(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1325,6 +1506,12 @@ def run_live_probe(
             raw_path=raw_path,
         )
         create_payload = raw_capture["create_file"]["response"]["body"]
+        if _response_body_has_semantic_failure(create_payload):
+            raise ProbeFailed(
+                "create_file response reported semantic failure",
+                stage=current_stage,
+                raw_path=raw_path,
+            )
         file_id = str(create_payload.get("file_id") or "") if isinstance(create_payload, dict) else ""
         upload_url = str(create_payload.get("upload_url") or "") if isinstance(create_payload, dict) else ""
         if not file_id or not upload_url or not _looks_like_signed_url(upload_url):
@@ -1402,6 +1589,13 @@ def run_live_probe(
             raw_capture=raw_capture,
             raw_path=raw_path,
         )
+        confirmation_payload = raw_capture["uploaded_confirmation"]["response"]["body"]
+        if _response_body_has_semantic_failure(confirmation_payload):
+            raise ProbeFailed(
+                "uploaded_confirmation response reported semantic failure",
+                stage=current_stage,
+                raw_path=raw_path,
+            )
 
         current_stage = "process_upload_stream"
         processing_path = "/backend-api/files/process_upload_stream"
@@ -1427,6 +1621,7 @@ def run_live_probe(
             "status_code": processing_response.status_code,
             "headers": _header_subset(processing_response.headers, {"Content-Type", "X-Request-Id"}),
             "events": [],
+            "done": False,
         }
         if not 200 <= int(processing_response.status_code or 0) < 300:
             processing_response_capture["body"] = _json_body(processing_response)
@@ -1447,10 +1642,11 @@ def run_live_probe(
             raw_path=raw_path,
         )
         try:
-            processing_events = _iter_json_stream(processing_response)
+            processing_events, processing_done = _iter_json_stream(processing_response)
         finally:
             processing_response.close()
         processing_response_capture["events"] = processing_events
+        processing_response_capture["done"] = processing_done
         _write_private_json(raw_path, raw_capture)
         if not processing_events:
             raise ProbeFailed(
@@ -1461,6 +1657,18 @@ def run_live_probe(
         if any(_processing_event_has_failure(event) for event in processing_events):
             raise ProbeFailed(
                 "process_upload_stream reported a terminal failure",
+                stage=current_stage,
+                raw_path=raw_path,
+            )
+        if not processing_done:
+            raise ProbeFailed(
+                "process_upload_stream did not report a complete marker",
+                stage=current_stage,
+                raw_path=raw_path,
+            )
+        if not any(_processing_event_has_success(event) for event in processing_events):
+            raise ProbeFailed(
+                "process_upload_stream has no successful terminal event",
                 stage=current_stage,
                 raw_path=raw_path,
             )
@@ -1520,6 +1728,7 @@ def run_live_probe(
             "status_code": conversation_response.status_code,
             "headers": _header_subset(conversation_response.headers, {"Content-Type", "X-Request-Id"}),
             "events": [],
+            "done": False,
         }
         if not 200 <= int(conversation_response.status_code or 0) < 300:
             conversation_response_capture["body"] = _json_body(conversation_response)
@@ -1540,15 +1749,41 @@ def run_live_probe(
             raw_path=raw_path,
         )
         try:
-            conversation_events = _iter_json_stream(conversation_response)
+            conversation_events, conversation_done = _iter_json_stream(conversation_response)
         finally:
             conversation_response.close()
         conversation_response_capture["events"] = conversation_events
+        conversation_response_capture["done"] = conversation_done
         conversation_id = _find_first_string(conversation_events, {"conversation_id"})
         _write_private_json(raw_path, raw_capture)
         if not conversation_events:
             raise ProbeFailed(
                 "conversation returned no JSON SSE events",
+                stage=current_stage,
+                raw_path=raw_path,
+            )
+        if any(_conversation_event_has_failure(event) for event in conversation_events):
+            raise ProbeFailed(
+                "conversation reported a terminal failure",
+                stage=current_stage,
+                raw_path=raw_path,
+            )
+        if not conversation_done:
+            raise ProbeFailed(
+                "conversation did not report a complete marker",
+                stage=current_stage,
+                raw_path=raw_path,
+            )
+        successful_answers = _conversation_successful_assistant_answers(conversation_events)
+        if not successful_answers:
+            raise ProbeFailed(
+                "conversation has no successful assistant terminal",
+                stage=current_stage,
+                raw_path=raw_path,
+            )
+        if successful_answers[-1] != PROBE_FILE_NAME:
+            raise ProbeFailed(
+                "conversation probe answer did not match the PDF filename",
                 stage=current_stage,
                 raw_path=raw_path,
             )

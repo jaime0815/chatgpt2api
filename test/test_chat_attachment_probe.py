@@ -64,10 +64,20 @@ def test_pdf_fixture_contains_complete_native_attachment_contract() -> None:
     assert metadata_attachment["mime_type"] == "application/pdf"
     assert metadata_attachment["name"] == "sample.pdf"
     assert metadata_attachment["id"] == "<file-id-redacted>"
+    assert conversation["response"]["done"] is True
+    terminal_summaries = [
+        summary
+        for summary in conversation["response"]["event_summaries"]
+        if summary.get("message_role") == "assistant"
+        and summary.get("message_status") == "finished_successfully"
+    ]
+    assert terminal_summaries
+    assert terminal_summaries[-1]["message_text"] == "sample.pdf"
 
     processing_status = fixture["processing_status"]
     assert processing_status
     assert all({"stage", "status"} <= item.keys() for item in processing_status)
+    assert fixture["processing"]["response"]["done"] is True
 
 
 def test_pdf_fixture_contains_no_credentials_or_live_signed_urls() -> None:
@@ -158,6 +168,7 @@ def _valid_sanitized_fixture() -> dict[str, Any]:
             },
             "response": {
                 "status_code": 200,
+                "done": True,
                 "events": [
                     {
                         "event": "file.processing.metadata",
@@ -188,15 +199,435 @@ def _valid_sanitized_fixture() -> dict[str, Any]:
             "response": {
                 "status_code": 200,
                 "event_count": 1,
+                "done": True,
                 "event_summaries": [
                     {
                         "conversation_id": "<conversation-id-redacted>",
                         "message_id": "<message-id-redacted>",
+                        "message_role": "assistant",
+                        "message_status": "finished_successfully",
+                        "message_end_turn": True,
+                        "message_text": "sample.pdf",
                     }
                 ],
             },
         },
     }
+
+
+def _sse_lines(events: list[dict[str, Any]], *, done: bool) -> list[bytes]:
+    lines = [f"data: {json.dumps(event)}".encode("utf-8") for event in events]
+    if done:
+        lines.append(b"data: [DONE]")
+    return lines
+
+
+class _FakeProbeResponse:
+    headers: dict[str, str] = {}
+    text = ""
+
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        body: dict[str, Any] | None = None,
+        lines: list[bytes] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._body = body or {}
+        self._lines = lines or []
+
+    def json(self) -> dict[str, Any]:
+        return self._body
+
+    def iter_lines(self) -> list[bytes]:
+        return self._lines
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeProbeSession:
+    def __init__(
+        self,
+        *,
+        create_body: dict[str, Any],
+        confirmation_body: dict[str, Any],
+        processing_lines: list[bytes],
+        conversation_lines: list[bytes],
+    ) -> None:
+        self.create_body = create_body
+        self.confirmation_body = confirmation_body
+        self.processing_lines = processing_lines
+        self.conversation_lines = conversation_lines
+
+    def post(self, url: str, *args, **kwargs) -> _FakeProbeResponse:
+        if url.endswith("/backend-api/files"):
+            return _FakeProbeResponse(200, body=self.create_body)
+        if url.endswith("/uploaded"):
+            return _FakeProbeResponse(200, body=self.confirmation_body)
+        if url.endswith("/process_upload_stream"):
+            return _FakeProbeResponse(200, lines=self.processing_lines)
+        if url.endswith("/backend-api/conversation"):
+            return _FakeProbeResponse(200, lines=self.conversation_lines)
+        raise AssertionError(f"unexpected POST {url}")
+
+    @staticmethod
+    def put(*args, **kwargs) -> _FakeProbeResponse:
+        return _FakeProbeResponse(201)
+
+
+class _FakeProbeClient:
+    base_url = "https://chatgpt.com"
+    user_agent = "fixture-test"
+
+    def __init__(self, session: _FakeProbeSession) -> None:
+        self.session = session
+
+    @staticmethod
+    def _headers(path: str, extra: dict[str, str]) -> dict[str, str]:
+        return dict(extra)
+
+    @staticmethod
+    def _bootstrap() -> None:
+        return None
+
+    @staticmethod
+    def _get_chat_requirements() -> dict[str, Any]:
+        return {}
+
+    @staticmethod
+    def _conversation_payload(*args, **kwargs) -> dict[str, Any]:
+        return {"parent_message_id": "parent-test"}
+
+    @staticmethod
+    def _conversation_headers(path: str, requirements: dict[str, Any]) -> dict[str, str]:
+        return {"Accept": "text/event-stream", "Content-Type": "application/json"}
+
+    @staticmethod
+    def delete_conversation(conversation_id: str) -> None:
+        return None
+
+    @staticmethod
+    def close() -> None:
+        return None
+
+
+def _successful_processing_events() -> list[dict[str, Any]]:
+    return [
+        {"event": "file.processing.started", "progress": 10},
+        {
+            "event": "file.processing.completed",
+            "status": "success",
+            "progress": 100,
+            "extra": {"mime_type": "application/pdf", "total_tokens": 42},
+        },
+    ]
+
+
+def _successful_conversation_events(answer: str = "sample.pdf") -> list[dict[str, Any]]:
+    return [
+        {
+            "conversation_id": "conversation-real-secret",
+            "message": {
+                "id": "reply-real-secret",
+                "author": {"role": "assistant"},
+                "status": "finished_successfully",
+                "end_turn": True,
+                "content": {"content_type": "text", "parts": [answer]},
+            },
+        }
+    ]
+
+
+def _successful_conversation_summary(answer: str = "sample.pdf") -> dict[str, Any]:
+    return {
+        "conversation_id": "<conversation-id-redacted>",
+        "message_id": "<message-id-redacted>",
+        "message_role": "assistant",
+        "message_status": "finished_successfully",
+        "message_end_turn": True,
+        "message_text": answer,
+    }
+
+
+def _run_fake_probe(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+    *,
+    create_body: dict[str, Any] | None = None,
+    confirmation_body: dict[str, Any] | None = None,
+    processing_events: list[dict[str, Any]] | None = None,
+    processing_done: bool = True,
+    conversation_events: list[dict[str, Any]] | None = None,
+    conversation_done: bool = True,
+) -> tuple[int, str, dict[str, Any], Path]:
+    from scripts import probe_chat_file_attachment as probe
+
+    fixture_path = tmp_path / "pdf-upload.json"
+    monkeypatch.setattr(probe, "FIXTURE_PATH", fixture_path)
+    session = _FakeProbeSession(
+        create_body=create_body
+        or {
+            "status": "success",
+            "file_id": "file-real-secret",
+            "upload_url": "https://storage.invalid/upload?sig=secret",
+        },
+        confirmation_body=confirmation_body
+        or {"status": "success", "success": True, "file_id": "file-real-secret"},
+        processing_lines=_sse_lines(
+            processing_events if processing_events is not None else _successful_processing_events(),
+            done=processing_done,
+        ),
+        conversation_lines=_sse_lines(
+            conversation_events if conversation_events is not None else _successful_conversation_events(),
+            done=conversation_done,
+        ),
+    )
+    with tempfile.NamedTemporaryFile(prefix="chat-attachment-probe-", suffix=".pdf", dir="/tmp") as pdf:
+        pdf.write(b"%PDF-1.4\n%%EOF\n")
+        pdf.flush()
+        monkeypatch.setenv("CHAT_ATTACHMENT_PROBE_PDF", pdf.name)
+        result = probe.main(
+            token_selector=lambda: "isolated-test-token",
+            client_factory=lambda token: _FakeProbeClient(session),
+        )
+
+    captured = capsys.readouterr()
+    output = captured.err + captured.out
+    raw_match = re.search(r"(?:raw_capture=|raw capture: )(/tmp/[^\s]+\.json)", output)
+    assert raw_match is not None
+    raw_path = Path(raw_match.group(1))
+    try:
+        raw_capture = json.loads(raw_path.read_text(encoding="utf-8"))
+    finally:
+        raw_path.unlink(missing_ok=True)
+    return result, captured.err, raw_capture, fixture_path
+
+
+def test_iter_json_stream_reports_done_marker() -> None:
+    from scripts.probe_chat_file_attachment import _iter_json_stream
+
+    event = {"event": "file.processing.completed", "status": "success"}
+    response = _FakeProbeResponse(200, lines=_sse_lines([event], done=True))
+
+    assert _iter_json_stream(response) == ([event], True)
+
+
+@pytest.mark.parametrize("processing_done", [False, True])
+def test_processing_requires_success_terminal_and_complete_marker(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+    processing_done: bool,
+) -> None:
+    result, stderr, raw_capture, fixture_path = _run_fake_probe(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        processing_events=[{"event": "file.processing.started", "progress": 10}],
+        processing_done=processing_done,
+    )
+
+    assert result == 1
+    assert "FAILED: stage=process_upload_stream" in stderr
+    assert raw_capture["failure"]["stage"] == "process_upload_stream"
+    assert raw_capture["processing"]["response"]["done"] is processing_done
+    assert not fixture_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("processing_done", "expected_error"),
+    [
+        (False, "complete marker"),
+        (True, "successful terminal"),
+    ],
+)
+def test_validator_requires_processing_semantic_completion(
+    processing_done: bool,
+    expected_error: str,
+) -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["processing"]["response"]["events"] = [
+        {"event": "file.processing.started", "progress": 10}
+    ]
+    fixture["processing"]["response"]["done"] = processing_done
+
+    with pytest.raises(ProbeFailed, match=expected_error):
+        _validate_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ("conversation_events", "conversation_done"),
+    [
+        ([{"conversation_id": "conversation-real-secret", "type": "error"}], True),
+        ([{"conversation_id": "conversation-real-secret", "status": "failed"}], True),
+        (_successful_conversation_events(), False),
+        (
+            [
+                {
+                    "conversation_id": "conversation-real-secret",
+                    "message": {
+                        "id": "reply-real-secret",
+                        "author": {"role": "assistant"},
+                        "status": "in_progress",
+                        "end_turn": False,
+                        "content": {"content_type": "text", "parts": ["sample.pdf"]},
+                    },
+                }
+            ],
+            True,
+        ),
+        (_successful_conversation_events("wrong.pdf"), True),
+    ],
+)
+def test_conversation_requires_successful_expected_answer_and_complete_marker(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+    conversation_events: list[dict[str, Any]],
+    conversation_done: bool,
+) -> None:
+    result, stderr, raw_capture, fixture_path = _run_fake_probe(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        conversation_events=conversation_events,
+        conversation_done=conversation_done,
+    )
+
+    assert result == 1
+    assert "FAILED: stage=conversation" in stderr
+    assert raw_capture["failure"]["stage"] == "conversation"
+    assert raw_capture["conversation"]["response"]["done"] is conversation_done
+    assert not fixture_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("event_summaries", "conversation_done", "expected_error"),
+    [
+        ([{"type": "error"}], True, "terminal failure"),
+        ([{"status": "failed"}], True, "terminal failure"),
+        ([_successful_conversation_summary()], False, "complete marker"),
+        (
+            [
+                {
+                    **_successful_conversation_summary(),
+                    "message_status": "in_progress",
+                    "message_end_turn": False,
+                }
+            ],
+            True,
+            "successful assistant terminal",
+        ),
+        ([_successful_conversation_summary("wrong.pdf")], True, "probe answer"),
+    ],
+)
+def test_validator_requires_conversation_semantic_completion(
+    event_summaries: list[dict[str, Any]],
+    conversation_done: bool,
+    expected_error: str,
+) -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["conversation"]["response"]["done"] = conversation_done
+    fixture["conversation"]["response"]["event_summaries"] = event_summaries
+
+    with pytest.raises(ProbeFailed, match=expected_error):
+        _validate_fixture(fixture)
+
+
+def test_conversation_finish_details_success_writes_fixture(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    events = _successful_conversation_events()
+    message = events[0]["message"]
+    message.pop("status")
+    message["metadata"] = {"finish_details": {"type": "finished_successfully"}}
+
+    result, stderr, raw_capture, fixture_path = _run_fake_probe(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        conversation_events=events,
+    )
+
+    assert result == 0
+    assert stderr == ""
+    assert "failure" not in raw_capture
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert fixture["conversation"]["response"]["done"] is True
+    assert fixture["conversation"]["response"]["event_summaries"][-1]["message_status"] == (
+        "finished_successfully"
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected_stage", "response_overrides"),
+    [
+        (
+            "create_file",
+            {
+                "create_body": {
+                    "status": "failed",
+                    "file_id": "file-real-secret",
+                    "upload_url": "https://storage.invalid/upload?sig=secret",
+                }
+            },
+        ),
+        (
+            "uploaded_confirmation",
+            {"confirmation_body": {"status": "failed", "success": True}},
+        ),
+        (
+            "uploaded_confirmation",
+            {"confirmation_body": {"status": "success", "success": False}},
+        ),
+    ],
+)
+def test_two_xx_response_body_failure_stops_probe(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+    expected_stage: str,
+    response_overrides: dict[str, Any],
+) -> None:
+    result, stderr, raw_capture, fixture_path = _run_fake_probe(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        **response_overrides,
+    )
+
+    assert result == 1
+    assert f"FAILED: stage={expected_stage}" in stderr
+    assert raw_capture["failure"]["stage"] == expected_stage
+    assert not fixture_path.exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["create_status", "confirmation_status", "confirmation_success"],
+)
+def test_validator_rejects_two_xx_response_body_failure(case: str) -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    if case == "create_status":
+        fixture["create_file"]["response"]["body"]["status"] = "failed"
+    elif case == "confirmation_status":
+        fixture["uploaded_confirmation"]["response"]["body"]["status"] = "failed"
+    else:
+        fixture["uploaded_confirmation"]["response"]["body"]["success"] = False
+
+    with pytest.raises(ProbeFailed, match="semantic failure"):
+        _validate_fixture(fixture)
 
 
 def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
@@ -281,6 +712,7 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
             },
             "response": {
                 "status_code": 200,
+                "done": True,
                 "events": [
                     {
                         "event": "file.processing.started",
@@ -328,11 +760,18 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
             },
             "response": {
                 "status_code": 200,
+                "done": True,
                 "events": [
                     {
                         "conversation_id": "conversation-real-secret",
                         "request_id": "req_conversation/+/opaque==",
-                        "message": {"id": "reply-real-secret"},
+                        "message": {
+                            "id": "reply-real-secret",
+                            "author": {"role": "assistant"},
+                            "status": "finished_successfully",
+                            "end_turn": True,
+                            "content": {"content_type": "text", "parts": ["sample.pdf"]},
+                        },
                     }
                 ],
             },
