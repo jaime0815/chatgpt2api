@@ -324,9 +324,13 @@ export const saveChatConversation = defaultStore.save
 export const renameChatConversation = defaultStore.rename
 export const saveChatAttachment = defaultStore.saveAttachment
 export const getChatAttachments = defaultStore.getAttachments
+export async function loadChatAttachment(subjectId: string, attachmentId: string) {
+  return (await defaultStore.getAttachments(subjectId, [attachmentId]))[0] ?? null
+}
 export const getChatPreferences = defaultStore.getPreferences
 export const saveChatPreferences = defaultStore.savePreferences
 export const deleteChatConversation = defaultStore.delete
 export const clearChatConversations = defaultStore.clear
-export const releaseUnreferencedChatAttachments = defaultStore.releaseUnreferencedAttachments
+export const releaseUnreferencedAttachments = defaultStore.releaseUnreferencedAttachments
+export const releaseUnreferencedChatAttachments = releaseUnreferencedAttachments
 export const getConversationAttachmentBytes = defaultStore.getConversationAttachmentBytes

@@ -8,6 +8,8 @@ import {
   createChatConversationStore,
   getChatAttachments,
   getChatConversation,
+  loadChatAttachment,
+  releaseUnreferencedAttachments,
   saveChatAttachment,
   saveChatConversation,
   type ChatStorageAdapter,
@@ -333,6 +335,11 @@ describe("chat conversation store", () => {
         title: "IndexedDB",
       })
       await expect(getChatAttachments(subjectId, [digest])).resolves.toHaveLength(1)
+      await expect(loadChatAttachment(subjectId, digest)).resolves.toMatchObject({
+        id: digest,
+        name: "indexeddb.txt",
+      })
+      await expect(releaseUnreferencedAttachments(subjectId)).resolves.toBe(0)
     } finally {
       await clearChatConversations(subjectId)
     }
