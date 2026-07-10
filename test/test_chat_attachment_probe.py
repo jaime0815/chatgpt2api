@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -92,6 +91,113 @@ def _all_keys(value: Any) -> list[str]:
     return []
 
 
+def _valid_sanitized_fixture() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "capture_kind": "real_upstream",
+        "captured_at": "2026-07-10T00:00:00+00:00",
+        "create_file": {
+            "request": {
+                "method": "POST",
+                "path": "/backend-api/files",
+                "headers": {"Content-Type": "application/json"},
+                "body": {
+                    "file_name": "sample.pdf",
+                    "file_size": 321,
+                    "mime_type": "application/pdf",
+                    "use_case": "multimodal",
+                },
+            },
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "status": "success",
+                    "file_id": "<file-id-redacted>",
+                    "upload_url": "<signed-upload-url-redacted>",
+                    "library_file_id": "<library-file-id-redacted>",
+                },
+            },
+        },
+        "blob_upload": {
+            "request": {
+                "method": "PUT",
+                "url": "<signed-upload-url-redacted>",
+                "headers": {
+                    "Content-Type": "application/pdf",
+                    "x-ms-blob-type": "BlockBlob",
+                    "x-ms-version": "2020-04-08",
+                },
+            },
+            "response": {"status_code": 201},
+        },
+        "uploaded_confirmation": {
+            "request": {
+                "method": "POST",
+                "path": "/backend-api/files/<file-id-redacted>/uploaded",
+                "headers": {"Content-Type": "application/json"},
+                "body": {},
+            },
+            "response": {
+                "status_code": 200,
+                "body": {"status": "success", "file_id": "<file-id-redacted>"},
+            },
+        },
+        "processing": {
+            "request": {
+                "method": "POST",
+                "path": "/backend-api/files/process_upload_stream",
+                "headers": {"Content-Type": "application/json"},
+                "body": {
+                    "file_id": "<file-id-redacted>",
+                    "file_name": "sample.pdf",
+                    "use_case": "multimodal",
+                    "index_for_retrieval": True,
+                    "entry_surface": "composer",
+                },
+            },
+            "response": {
+                "status_code": 200,
+                "events": [
+                    {
+                        "event": "file.processing.metadata",
+                        "progress": 100,
+                        "extra": {
+                            "mime_type": "application/pdf",
+                            "total_tokens": 42,
+                            "metadata_object_id": "<library-file-id-redacted>",
+                        },
+                    }
+                ],
+            },
+        },
+        "processing_status": [
+            {"stage": "process_upload_stream", "status": "file.processing.metadata", "progress": 100}
+        ],
+        "conversation": {
+            "request": {"method": "POST", "path": "/backend-api/conversation"},
+            "content_part": {"content_type": "text", "parts": ["Inspect the PDF."]},
+            "metadata_attachment": {
+                "id": "<file-id-redacted>",
+                "name": "sample.pdf",
+                "mime_type": "application/pdf",
+                "size": 321,
+                "is_big_paste": False,
+                "library_file_id": "<library-file-id-redacted>",
+            },
+            "response": {
+                "status_code": 200,
+                "event_count": 1,
+                "event_summaries": [
+                    {
+                        "conversation_id": "<conversation-id-redacted>",
+                        "message_id": "<message-id-redacted>",
+                    }
+                ],
+            },
+        },
+    }
+
+
 def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
     from scripts.probe_chat_file_attachment import build_sanitized_fixture
 
@@ -116,8 +222,19 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                     "Traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
                 },
                 "body": {
+                    "status": (
+                        "success; diagnostic=https://storage.invalid/upload"
+                        "?x-amz-credential=embedded-credential"
+                        "&x-amz-signature=embedded-secret-value "
+                        "gcs=https://storage.googleapis.com/bucket/object"
+                        "?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+                        "&X-Goog-Credential=service-account%40example.invalid"
+                        "&X-Goog-Signature=gcs-secret-value end"
+                    ),
                     "file_id": "file-real-secret",
                     "upload_url": "https://example.blob.core.windows.net/a?sv=1&sig=secret",
+                    "sessionToken": "session-token-must-not-survive",
+                    "auth_token": "auth-token-must-not-survive",
                 },
             },
         },
@@ -175,6 +292,7 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                             "mime_type": "application/pdf",
                             "total_tokens": 42,
                             "version_id": "version_opaque/+/identifier==",
+                            "sessionToken": "processing-session-secret",
                         },
                     },
                 ],
@@ -196,6 +314,7 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                                         "name": "sample.pdf",
                                         "mime_type": "application/pdf",
                                         "size": 321,
+                                        "auth_token": "attachment-auth-secret",
                                     }
                                 ]
                             },
@@ -234,6 +353,13 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
     assert "parent-real-secret" not in serialized
     assert "must-not-survive" not in serialized
     assert "sig=secret" not in serialized
+    assert "embedded-secret-value" not in serialized
+    assert "gcs-secret-value" not in serialized
+    assert "processing-session-secret" not in serialized
+    assert "attachment-auth-secret" not in serialized
+    assert "sessionToken" not in _all_keys(fixture)
+    assert "auth_token" not in _all_keys(fixture)
+    assert "<signed-upload-url-redacted>" in fixture["create_file"]["response"]["body"]["status"]
     for opaque_identifier in (
         "req_01JZ/opaque+value==.7f",
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
@@ -252,64 +378,233 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
 def test_validator_rejects_leftover_sensitive_response_identifier() -> None:
     from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
 
-    fixture = {
-        "capture_kind": "real_upstream",
-        "create_file": {
-            "request": {
-                "method": "POST",
-                "path": "/backend-api/files",
-                "body": {"file_name": "sample.pdf"},
-            },
-            "response": {
-                "status_code": 200,
-                "body": {"file_id": "<file-id-redacted>"},
-            },
-        },
-        "blob_upload": {
-            "request": {
-                "method": "PUT",
-                "url": "<signed-upload-url-redacted>",
-                "headers": {
-                    "Content-Type": "application/pdf",
-                    "x-ms-blob-type": "BlockBlob",
-                    "x-ms-version": "2020-04-08",
-                },
-            },
-            "response": {
-                "status_code": 201,
-                "headers": {"x-operation-id": "opaque.operation/id:+=="},
-            },
-        },
-        "uploaded_confirmation": {"response": {"status_code": 200}},
-        "processing_status": [{"stage": "process_upload_stream", "status": "file.processing.metadata"}],
-        "conversation": {
-            "content_part": {"content_type": "text", "parts": ["Inspect the PDF."]},
-            "metadata_attachment": {"mime_type": "application/pdf"},
-            "response": {"status_code": 200, "event_count": 1},
-        },
+    fixture = _valid_sanitized_fixture()
+    fixture["blob_upload"]["response"]["headers"] = {
+        "x-operation-id": "opaque.operation/id:+=="
     }
 
     with pytest.raises(ProbeFailed, match="sensitive response identifiers"):
         _validate_fixture(fixture)
 
 
-def test_direct_cli_reports_missing_account_as_blocked() -> None:
-    script = Path(__file__).parents[1] / "scripts" / "probe_chat_file_attachment.py"
+def test_validator_rejects_unknown_credential_key() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["create_file"]["response"]["body"]["sessionToken"] = "opaque-session-secret"
+
+    with pytest.raises(ProbeFailed, match="credential"):
+        _validate_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ("path", "raw_value"),
+    [
+        (("create_file", "response", "body", "library_file_id"), "library-live-secret"),
+        (("uploaded_confirmation", "response", "body", "file_id"), "file-live-secret"),
+        (("processing", "request", "body", "file_id"), "file-live-secret"),
+        (
+            ("processing", "response", "events", 0, "extra", "metadata_object_id"),
+            "metadata-live-secret",
+        ),
+        (("conversation", "metadata_attachment", "library_file_id"), "library-live-secret"),
+        (
+            ("conversation", "response", "event_summaries", 0, "conversation_id"),
+            "conversation-live-secret",
+        ),
+        (
+            ("conversation", "response", "event_summaries", 0, "message_id"),
+            "message-live-secret",
+        ),
+        (
+            ("create_file", "response", "body", "status"),
+            "success 550e8400-e29b-41d4-a716-446655440000",
+        ),
+        (
+            ("create_file", "response", "body", "library_file_id"),
+            {"unexpected": "object"},
+        ),
+    ],
+)
+def test_validator_rejects_raw_identifiers_in_allowed_fields(
+    path: tuple[str | int, ...],
+    raw_value: Any,
+) -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    target: Any = fixture
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = raw_value
+
+    with pytest.raises(ProbeFailed, match="identifier|redacted"):
+        _validate_fixture(fixture)
+
+
+def test_validator_rejects_embedded_signed_url_independently() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["create_file"]["response"]["body"]["status"] = (
+        "failed: https://storage.invalid/a?x-amz-credential=opaque&x-amz-signature=secret"
+    )
+
+    with pytest.raises(ProbeFailed, match="credential or signed URL"):
+        _validate_fixture(fixture)
+
+
+def test_validator_rejects_invalid_fixture_under_python_optimized_mode() -> None:
+    fixture = _valid_sanitized_fixture()
+    fixture["capture_kind"] = "forged"
+    script = """
+import json
+import sys
+from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+fixture = json.loads(sys.stdin.read())
+try:
+    _validate_fixture(fixture)
+except ProbeFailed:
+    raise SystemExit(0)
+raise SystemExit(9)
+"""
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        cwd=Path(__file__).parents[1],
+        input=json.dumps(fixture),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_cli_reports_missing_account_without_reading_real_pool(monkeypatch, capsys) -> None:
+    from scripts import probe_chat_file_attachment as probe
+
+    monkeypatch.setattr(
+        probe,
+        "_select_access_token",
+        lambda: pytest.fail("real account pool must not be read by this test"),
+    )
     with tempfile.NamedTemporaryFile(prefix="chat-attachment-probe-", suffix=".pdf", dir="/tmp") as pdf:
         pdf.write(b"%PDF-1.4\n%%EOF\n")
         pdf.flush()
-        env = os.environ.copy()
-        env["CHAT_ATTACHMENT_PROBE_PDF"] = pdf.name
-        env.pop("CHAT_ATTACHMENT_PROBE_ACCESS_TOKEN", None)
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=script.parents[1],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
+        monkeypatch.setenv("CHAT_ATTACHMENT_PROBE_PDF", pdf.name)
+        result = probe.main(token_selector=lambda: "")
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert "BLOCKED: configure a text account" in captured.err
+    assert "ModuleNotFoundError" not in captured.err
+
+
+def test_non_2xx_records_raw_stage_and_cli_prints_safe_diagnostics(monkeypatch, capsys) -> None:
+    from scripts import probe_chat_file_attachment as probe
+
+    class FakeResponse:
+        status_code = 503
+        headers = {"X-Request-Id": "request-secret"}
+        text = ""
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            return {
+                "error": "upstream unavailable",
+                "sessionToken": "raw-session-secret",
+                "debug": "https://storage.invalid/a?sig=raw-signed-secret",
+            }
+
+    class FakeSession:
+        @staticmethod
+        def post(*args, **kwargs) -> FakeResponse:
+            return FakeResponse()
+
+    class FakeClient:
+        base_url = "https://chatgpt.com"
+        session = FakeSession()
+
+        @staticmethod
+        def _headers(path: str, extra: dict[str, str]) -> dict[str, str]:
+            return dict(extra)
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    with tempfile.NamedTemporaryFile(prefix="chat-attachment-probe-", suffix=".pdf", dir="/tmp") as pdf:
+        pdf.write(b"%PDF-1.4\n%%EOF\n")
+        pdf.flush()
+        monkeypatch.setenv("CHAT_ATTACHMENT_PROBE_PDF", pdf.name)
+        result = probe.main(
+            token_selector=lambda: "isolated-test-token",
+            client_factory=lambda token: FakeClient(),
         )
 
-    assert result.returncode == 2
-    assert "BLOCKED: configure a text account" in result.stderr
-    assert "ModuleNotFoundError" not in result.stderr
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "FAILED: stage=create_file status=503 raw_capture=/tmp/" in captured.err
+    assert "raw-session-secret" not in captured.err
+    assert "raw-signed-secret" not in captured.err
+    raw_match = re.search(r"raw_capture=(/tmp/[^\s]+\.json)", captured.err)
+    assert raw_match is not None
+    raw_path = Path(raw_match.group(1))
+    try:
+        raw_capture = json.loads(raw_path.read_text(encoding="utf-8"))
+        assert raw_capture["failure"]["stage"] == "create_file"
+        assert raw_capture["failure"]["status_code"] == 503
+        assert raw_capture["create_file"]["response"]["status_code"] == 503
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+
+def test_malformed_create_response_reports_create_stage(monkeypatch, capsys) -> None:
+    from scripts import probe_chat_file_attachment as probe
+
+    class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            return {"file_id": "file-real-secret"}
+
+    class FakeSession:
+        @staticmethod
+        def post(*args, **kwargs) -> FakeResponse:
+            return FakeResponse()
+
+    class FakeClient:
+        base_url = "https://chatgpt.com"
+        session = FakeSession()
+
+        @staticmethod
+        def _headers(path: str, extra: dict[str, str]) -> dict[str, str]:
+            return dict(extra)
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    with tempfile.NamedTemporaryFile(prefix="chat-attachment-probe-", suffix=".pdf", dir="/tmp") as pdf:
+        pdf.write(b"%PDF-1.4\n%%EOF\n")
+        pdf.flush()
+        monkeypatch.setenv("CHAT_ATTACHMENT_PROBE_PDF", pdf.name)
+        result = probe.main(
+            token_selector=lambda: "isolated-test-token",
+            client_factory=lambda token: FakeClient(),
+        )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "FAILED: stage=create_file status=unknown raw_capture=/tmp/" in captured.err
+    raw_match = re.search(r"raw_capture=(/tmp/[^\s]+\.json)", captured.err)
+    assert raw_match is not None
+    raw_path = Path(raw_match.group(1))
+    try:
+        raw_capture = json.loads(raw_path.read_text(encoding="utf-8"))
+        assert raw_capture["failure"] == {"stage": "create_file", "status_code": None}
+    finally:
+        raw_path.unlink(missing_ok=True)
