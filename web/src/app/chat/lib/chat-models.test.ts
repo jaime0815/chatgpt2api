@@ -24,12 +24,37 @@ describe("chat model helpers", () => {
     expect(filterChatModels(models)).toEqual(["auto", "gpt-5.4", "o3"])
   })
 
-  it("falls back explicitly to auto when a stored model disappeared", () => {
+  it("keeps an available stored chat model without an unavailable warning", () => {
     const availableModels = ["auto", "gpt-5.4", "o3"]
 
-    expect(resolveChatModelSelection("gpt-5.4", availableModels)).toBe("gpt-5.4")
-    expect(resolveChatModelSelection("removed-model", availableModels)).toBe("auto")
-    expect(resolveChatModelSelection("gpt-image-2", availableModels)).toBe("auto")
-    expect(resolveChatModelSelection(null, availableModels)).toBe("auto")
+    expect(resolveChatModelSelection("gpt-5.4", availableModels)).toEqual({
+      selected: "gpt-5.4",
+      unavailable: null,
+    })
+  })
+
+  it("reports a stored model that disappeared while falling back to auto", () => {
+    expect(resolveChatModelSelection("removed-model", ["auto", "gpt-5.4"])).toEqual({
+      selected: "auto",
+      unavailable: "removed-model",
+    })
+  })
+
+  it("reports a stored image model as unavailable for chat", () => {
+    expect(resolveChatModelSelection("gpt-image-2", ["auto", "gpt-5.4"])).toEqual({
+      selected: "auto",
+      unavailable: "gpt-image-2",
+    })
+  })
+
+  it("uses auto without an unavailable warning when nothing was stored", () => {
+    expect(resolveChatModelSelection(null, ["auto", "gpt-5.4"])).toEqual({
+      selected: "auto",
+      unavailable: null,
+    })
+    expect(resolveChatModelSelection("   ", ["auto", "gpt-5.4"])).toEqual({
+      selected: "auto",
+      unavailable: null,
+    })
   })
 })

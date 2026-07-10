@@ -2,6 +2,11 @@ export const AUTO_CHAT_MODEL_ID = "auto"
 
 type ChatModelLike = string | { id?: unknown }
 
+export type ChatModelSelectionResolution = {
+  selected: string
+  unavailable: string | null
+}
+
 function modelId(item: ChatModelLike) {
   return String(typeof item === "string" ? item : item.id || "").trim()
 }
@@ -29,12 +34,20 @@ export function filterChatModels(models: readonly ChatModelLike[]) {
 export function resolveChatModelSelection(
   storedModel: string | null | undefined,
   availableModels: readonly ChatModelLike[],
-) {
+): ChatModelSelectionResolution {
   const selected = String(storedModel || "").trim()
-  if (!selected || isImageModelId(selected)) {
-    return AUTO_CHAT_MODEL_ID
+  if (!selected) {
+    return { selected: AUTO_CHAT_MODEL_ID, unavailable: null }
+  }
+  if (selected === AUTO_CHAT_MODEL_ID) {
+    return { selected: AUTO_CHAT_MODEL_ID, unavailable: null }
+  }
+  if (isImageModelId(selected)) {
+    return { selected: AUTO_CHAT_MODEL_ID, unavailable: selected }
   }
 
   const availableIds = new Set(availableModels.map(modelId).filter(Boolean))
-  return availableIds.has(selected) ? selected : AUTO_CHAT_MODEL_ID
+  return availableIds.has(selected)
+    ? { selected, unavailable: null }
+    : { selected: AUTO_CHAT_MODEL_ID, unavailable: selected }
 }
