@@ -13,6 +13,7 @@ import pytest
 import starlette.formparsers as starlette_formparsers
 from fastapi import FastAPI, HTTPException, Request
 from starlette.datastructures import FormData, Headers, UploadFile
+from starlette.requests import ClientDisconnect
 
 import api.chat_inputs as chat_inputs
 from api.chat_inputs import _parse_chat_stream_form, parse_chat_stream_request
@@ -665,5 +666,68 @@ def test_streaming_multipart_limit_stops_before_full_parse_and_closes_partial_fi
     assert response.status_code == 413
     assert response.json()["detail"]["error"] == "multipart request exceeds 102MB limit"
     assert stream.yielded < len(chunks)
+    assert opened_files
+    assert all(file.closed for file in opened_files)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_exception"),
+    [
+        ("disconnect", ClientDisconnect),
+        ("cancelled", asyncio.CancelledError),
+        ("io-error", OSError),
+    ],
+)
+def test_interrupted_multipart_stream_closes_partial_file_without_swallowing_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_exception: type[BaseException],
+) -> None:
+    prefix, _, boundary = _multipart_segments(b"document")
+    opened_files: list[Any] = []
+    original_spooled_file = starlette_formparsers.SpooledTemporaryFile
+    receive_count = 0
+    stream_error: BaseException | None = None
+    if failure == "cancelled":
+        stream_error = asyncio.CancelledError("request cancelled")
+    elif failure == "io-error":
+        stream_error = OSError("request body read failed")
+
+    def tracking_spooled_file(*args: Any, **kwargs: Any):
+        file = original_spooled_file(*args, **kwargs)
+        opened_files.append(file)
+        return file
+
+    async def receive() -> dict[str, Any]:
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count == 1:
+            return {"type": "http.request", "body": prefix, "more_body": True}
+        if failure == "disconnect":
+            return {"type": "http.disconnect"}
+        assert stream_error is not None
+        raise stream_error
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/parse",
+        "raw_path": b"/parse",
+        "query_string": b"",
+        "headers": [(b"content-type", f"multipart/form-data; boundary={boundary}".encode())],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+    request = Request(scope, receive)
+    monkeypatch.setattr(starlette_formparsers, "SpooledTemporaryFile", tracking_spooled_file)
+
+    with pytest.raises(expected_exception) as caught:
+        asyncio.run(parse_chat_stream_request(request))
+
+    if stream_error is not None:
+        assert caught.value is stream_error
     assert opened_files
     assert all(file.closed for file in opened_files)

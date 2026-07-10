@@ -260,6 +260,16 @@ async def _limited_request_stream(request: Request) -> AsyncGenerator[bytes, Non
         yield chunk
 
 
+def _close_multipart_parser_files(parser: MultiPartParser) -> None:
+    files = tuple(parser._files_to_close_on_error)
+    parser._files_to_close_on_error.clear()
+    for file in files:
+        try:
+            file.close()
+        except BaseException:
+            pass
+
+
 async def _parse_limited_multipart_form(request: Request) -> FormData:
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type != "multipart/form-data":
@@ -275,10 +285,14 @@ async def _parse_limited_multipart_form(request: Request) -> FormData:
     )
     try:
         return await parser.parse()
-    except _MultipartRequestTooLarge:
-        _request_too_large()
-    except MultiPartException as exc:
-        raise HTTPException(status_code=400, detail={"error": exc.message}) from exc
+    except BaseException as exc:
+        # Starlette only cleans these files for MultiPartException, not disconnects or cancellation.
+        _close_multipart_parser_files(parser)
+        if isinstance(exc, _MultipartRequestTooLarge):
+            _request_too_large()
+        if isinstance(exc, MultiPartException):
+            raise HTTPException(status_code=400, detail={"error": exc.message}) from exc
+        raise
 
 
 async def _parse_chat_stream_form(form: FormData) -> ChatStreamCommand:
