@@ -589,6 +589,24 @@ def test_conversation_finish_details_success_writes_fixture(
             "uploaded_confirmation",
             {"confirmation_body": {"status": "success", "success": False}},
         ),
+        (
+            "create_file",
+            {
+                "create_body": {
+                    "status": "pending",
+                    "file_id": "file-real-secret",
+                    "upload_url": "https://storage.invalid/upload?sig=secret",
+                }
+            },
+        ),
+        (
+            "uploaded_confirmation",
+            {"confirmation_body": {"status": "pending", "success": True}},
+        ),
+        (
+            "uploaded_confirmation",
+            {"confirmation_body": {"status": "success", "success": "true"}},
+        ),
     ],
 )
 def test_two_xx_response_body_failure_stops_probe(
@@ -612,19 +630,26 @@ def test_two_xx_response_body_failure_stops_probe(
 
 
 @pytest.mark.parametrize(
-    "case",
-    ["create_status", "confirmation_status", "confirmation_success"],
+    ("case", "value"),
+    [
+        ("create_status", "failed"),
+        ("create_status", "pending"),
+        ("confirmation_status", "failed"),
+        ("confirmation_status", "pending"),
+        ("confirmation_success", False),
+        ("confirmation_success", "true"),
+    ],
 )
-def test_validator_rejects_two_xx_response_body_failure(case: str) -> None:
+def test_validator_rejects_two_xx_response_body_failure(case: str, value: Any) -> None:
     from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
 
     fixture = _valid_sanitized_fixture()
     if case == "create_status":
-        fixture["create_file"]["response"]["body"]["status"] = "failed"
+        fixture["create_file"]["response"]["body"]["status"] = value
     elif case == "confirmation_status":
-        fixture["uploaded_confirmation"]["response"]["body"]["status"] = "failed"
+        fixture["uploaded_confirmation"]["response"]["body"]["status"] = value
     else:
-        fixture["uploaded_confirmation"]["response"]["body"]["success"] = False
+        fixture["uploaded_confirmation"]["response"]["body"]["success"] = value
 
     with pytest.raises(ProbeFailed, match="semantic failure"):
         _validate_fixture(fixture)
@@ -655,15 +680,7 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                     "Traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
                 },
                 "body": {
-                    "status": (
-                        "success; diagnostic=https://storage.invalid/upload"
-                        "?x-amz-credential=embedded-credential"
-                        "&x-amz-signature=embedded-secret-value "
-                        "gcs=https://storage.googleapis.com/bucket/object"
-                        "?X-Goog-Algorithm=GOOG4-RSA-SHA256"
-                        "&X-Goog-Credential=service-account%40example.invalid"
-                        "&X-Goog-Signature=gcs-secret-value end"
-                    ),
+                    "status": "success",
                     "file_id": "file-real-secret",
                     "upload_url": "https://example.blob.core.windows.net/a?sv=1&sig=secret",
                     "sessionToken": "session-token-must-not-survive",
@@ -725,6 +742,15 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                         "extra": {
                             "mime_type": "application/pdf",
                             "total_tokens": 42,
+                            "library_persistence_reason": (
+                                "diagnostic=https://storage.invalid/upload"
+                                "?x-amz-credential=embedded-credential"
+                                "&x-amz-signature=embedded-secret-value "
+                                "gcs=https://storage.googleapis.com/bucket/object"
+                                "?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+                                "&X-Goog-Credential=service-account%40example.invalid"
+                                "&X-Goog-Signature=gcs-secret-value end"
+                            ),
                             "version_id": "version_opaque/+/identifier==",
                             "sessionToken": "processing-session-secret",
                         },
@@ -803,7 +829,10 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
     assert "attachment-auth-secret" not in serialized
     assert "sessionToken" not in _all_keys(fixture)
     assert "auth_token" not in _all_keys(fixture)
-    assert "<signed-upload-url-redacted>" in fixture["create_file"]["response"]["body"]["status"]
+    persistence_reason = fixture["processing"]["response"]["events"][1]["extra"][
+        "library_persistence_reason"
+    ]
+    assert "<signed-upload-url-redacted>" in persistence_reason
     for opaque_identifier in (
         "req_01JZ/opaque+value==.7f",
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",

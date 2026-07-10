@@ -201,6 +201,14 @@ CONVERSATION_TERMINAL_SUCCESSES = {
     "succeeded",
     "success",
 }
+RESPONSE_SEMANTIC_SUCCESSES = {
+    "complete",
+    "completed",
+    "finished",
+    "finished_successfully",
+    "succeeded",
+    "success",
+}
 
 
 class ProbeBlocked(RuntimeError):
@@ -548,7 +556,13 @@ def _processing_event_has_success(event: Any) -> bool:
 
 def _response_body_has_semantic_failure(value: Any) -> bool:
     body = _as_dict(value)
-    return _processing_state_is_failure(body.get("status")) or body.get("success") is False
+    if "status" in body:
+        status = str(body.get("status") or "").strip().lower().rsplit(".", 1)[-1]
+        if status not in RESPONSE_SEMANTIC_SUCCESSES:
+            return True
+    if "success" in body and body.get("success") is not True:
+        return True
+    return False
 
 
 def _conversation_event_candidates(event: Any) -> Iterable[dict[str, Any]]:
