@@ -24,7 +24,10 @@ const adminNavItems = [
   { href: "/settings", label: "设置" },
 ];
 
-const userNavItems = [{ href: "/image", label: "画图" }];
+const userNavItems = [
+  { href: "/chat", label: "聊天" },
+  { href: "/image", label: "画图" },
+];
 
 function buildThirdPartyHref(appUrl: string, baseUrl: string, apiKey: string) {
   const url = appUrl.trim();
