@@ -8,23 +8,29 @@ from dataclasses import FrozenInstanceError
 from io import BytesIO
 from typing import Any
 
+import httpx
 import pytest
-from fastapi import HTTPException
+import starlette.formparsers as starlette_formparsers
+from fastapi import FastAPI, HTTPException, Request
 from starlette.datastructures import FormData, Headers, UploadFile
 
-from api.chat_inputs import parse_chat_stream_request
+import api.chat_inputs as chat_inputs
+from api.chat_inputs import _parse_chat_stream_form, parse_chat_stream_request
 from services.chat_types import ChatAttachmentBlob, ChatMessage, ChatStreamCommand
 
 
 MIB = 1024 * 1024
 
 
-class StubRequest:
-    def __init__(self, form: FormData) -> None:
-        self._form = form
+class TrackingAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.yielded = 0
 
-    async def form(self) -> FormData:
-        return self._form
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.yielded += 1
+            yield chunk
 
 
 def _write_pattern(file: Any, size: int, marker: int) -> str:
@@ -100,8 +106,7 @@ def _payload(
 
 
 def _parse_form(entries: list[tuple[str, str | UploadFile]]) -> ChatStreamCommand:
-    request = StubRequest(FormData(entries))
-    return asyncio.run(parse_chat_stream_request(request))  # type: ignore[arg-type]
+    return asyncio.run(_parse_chat_stream_form(FormData(entries)))
 
 
 def _parse(payload: dict[str, Any], uploads: list[UploadFile]) -> ChatStreamCommand:
@@ -522,3 +527,143 @@ def test_closes_upload_when_request_json_is_invalid() -> None:
     assert caught.value.status_code == 400
     assert "invalid request JSON" in caught.value.detail["error"]
     assert upload.file.closed
+
+
+@pytest.mark.parametrize(
+    "raw_request",
+    [
+        "[" * 10_000 + "0" + "]" * 10_000,
+        '{"model":' + "9" * 5000 + ',"messages":[],"attachments":[]}',
+    ],
+    ids=["deeply-nested-json", "oversized-json-integer"],
+)
+def test_normalizes_pathological_json_decode_failures_to_400(raw_request: str) -> None:
+    with pytest.raises(HTTPException) as caught:
+        _parse_form([("request", raw_request)])
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail == {"error": "invalid request JSON"}
+
+
+def _chat_input_test_app() -> FastAPI:
+    app = FastAPI()
+
+    @app.post("/parse")
+    async def parse(request: Request) -> dict[str, int]:
+        command = await parse_chat_stream_request(request)
+        return {"attachment_count": len(command.attachments)}
+
+    return app
+
+
+def _multipart_segments(file_data: bytes) -> tuple[bytes, bytes, str]:
+    boundary = "chat-input-boundary"
+    manifest = {
+        "id": "document-1",
+        "file_name": "document.pdf",
+        "mime_type": "application/pdf",
+        "size": len(file_data),
+        "sha256": hashlib.sha256(file_data).hexdigest(),
+    }
+    payload = _payload([manifest])
+    prefix = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="request"\r\n\r\n'
+        f"{json.dumps(payload)}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="files"; filename="document.pdf"\r\n'
+        "Content-Type: application/pdf\r\n\r\n"
+    ).encode()
+    suffix = f"\r\n--{boundary}--\r\n".encode()
+    return prefix, suffix, boundary
+
+
+async def _post_raw_multipart(
+    stream: TrackingAsyncStream,
+    boundary: str,
+    *,
+    content_length: str | None,
+) -> httpx.Response:
+    headers = {"content-type": f"multipart/form-data; boundary={boundary}"}
+    if content_length is not None:
+        headers["content-length"] = content_length
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_chat_input_test_app()),
+        base_url="http://testserver",
+    ) as client:
+        return await client.post("/parse", headers=headers, content=stream)
+
+
+def test_real_multipart_http_request_parses_and_closes_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+    file_data = b"document"
+    prefix, suffix, boundary = _multipart_segments(file_data)
+    body = prefix + file_data + suffix
+    stream = TrackingAsyncStream([body])
+    opened_files: list[Any] = []
+    original_spooled_file = starlette_formparsers.SpooledTemporaryFile
+
+    def tracking_spooled_file(*args: Any, **kwargs: Any):
+        file = original_spooled_file(*args, **kwargs)
+        opened_files.append(file)
+        return file
+
+    monkeypatch.setattr(starlette_formparsers, "SpooledTemporaryFile", tracking_spooled_file)
+
+    response = asyncio.run(
+        _post_raw_multipart(stream, boundary, content_length=str(len(body)))
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"attachment_count": 1}
+    assert stream.yielded == 1
+    assert opened_files
+    assert all(file.closed for file in opened_files)
+
+
+def test_rejects_declared_oversized_multipart_before_reading_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    file_data = b"document"
+    prefix, suffix, boundary = _multipart_segments(file_data)
+    body = prefix + file_data + suffix
+    hard_limit = len(body) + 64
+    stream = TrackingAsyncStream([body])
+    monkeypatch.setattr(chat_inputs, "MAX_MULTIPART_REQUEST_BYTES", hard_limit, raising=False)
+
+    response = asyncio.run(
+        _post_raw_multipart(stream, boundary, content_length=str(hard_limit + 1))
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"]["error"] == "multipart request exceeds 102MB limit"
+    assert stream.yielded == 0
+
+
+@pytest.mark.parametrize("content_length", [None, "1"], ids=["missing-length", "forged-length"])
+def test_streaming_multipart_limit_stops_before_full_parse_and_closes_partial_file(
+    monkeypatch: pytest.MonkeyPatch,
+    content_length: str | None,
+) -> None:
+    file_data = b"x" * 192
+    prefix, suffix, boundary = _multipart_segments(file_data)
+    chunks = [prefix, file_data[:64], file_data[64:128], file_data[128:], suffix]
+    stream = TrackingAsyncStream(chunks)
+    hard_limit = len(prefix) + 96
+    opened_files: list[Any] = []
+    original_spooled_file = starlette_formparsers.SpooledTemporaryFile
+
+    def tracking_spooled_file(*args: Any, **kwargs: Any):
+        file = original_spooled_file(*args, **kwargs)
+        opened_files.append(file)
+        return file
+
+    monkeypatch.setattr(chat_inputs, "MAX_MULTIPART_REQUEST_BYTES", hard_limit, raising=False)
+    monkeypatch.setattr(starlette_formparsers, "SpooledTemporaryFile", tracking_spooled_file)
+
+    response = asyncio.run(
+        _post_raw_multipart(stream, boundary, content_length=content_length)
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"]["error"] == "multipart request exceeds 102MB limit"
+    assert stream.yielded < len(chunks)
+    assert opened_files
+    assert all(file.closed for file in opened_files)

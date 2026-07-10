@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Literal, NoReturn
 
 from fastapi import HTTPException, Request
-from starlette.datastructures import UploadFile
+from starlette.datastructures import FormData, UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from services.chat_types import ChatAttachmentBlob, ChatMessage, ChatStreamCommand
 
@@ -19,7 +21,11 @@ MAX_IMAGE_BYTES = 10 * MIB
 MAX_DOCUMENT_BYTES = 25 * MIB
 MAX_MESSAGE_ATTACHMENT_BYTES = 50 * MIB
 MAX_REQUEST_WORKING_SET_BYTES = 100 * MIB
+MAX_MULTIPART_REQUEST_BYTES = MAX_REQUEST_WORKING_SET_BYTES + 2 * MIB
+MAX_REQUEST_JSON_BYTES = MIB
+MAX_MULTIPART_FILES = 1000
 READ_CHUNK_BYTES = MIB
+MULTIPART_REQUEST_LIMIT_ERROR = "multipart request exceeds 102MB limit"
 
 AttachmentKind = Literal["image", "document"]
 
@@ -58,8 +64,16 @@ class _AttachmentManifest:
     kind: AttachmentKind
 
 
+class _MultipartRequestTooLarge(MultiPartException):
+    pass
+
+
 def _bad_request(message: str) -> NoReturn:
     raise HTTPException(status_code=400, detail={"error": message})
+
+
+def _request_too_large() -> NoReturn:
+    raise HTTPException(status_code=413, detail={"error": MULTIPART_REQUEST_LIMIT_ERROR})
 
 
 def _required_string(value: object, field: str, *, allow_empty: bool = False) -> str:
@@ -136,7 +150,7 @@ def _parse_message(value: object, index: int) -> ChatMessage:
 def _parse_request_json(raw_request: str) -> tuple[str, tuple[ChatMessage, ...], tuple[_AttachmentManifest, ...], str]:
     try:
         payload = json.loads(raw_request)
-    except (json.JSONDecodeError, UnicodeError) as exc:
+    except (json.JSONDecodeError, UnicodeError, RecursionError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "invalid request JSON"}) from exc
     if not isinstance(payload, dict):
         _bad_request("request JSON must be an object")
@@ -223,8 +237,51 @@ async def _close_uploads(uploads: list[UploadFile]) -> None:
             pass
 
 
-async def parse_chat_stream_request(request: Request) -> ChatStreamCommand:
-    form = await request.form()
+def _validate_content_length(request: Request) -> None:
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is None:
+        return
+    try:
+        content_length = int(raw_content_length)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid Content-Length header"}) from exc
+    if content_length < 0:
+        _bad_request("invalid Content-Length header")
+    if content_length > MAX_MULTIPART_REQUEST_BYTES:
+        _request_too_large()
+
+
+async def _limited_request_stream(request: Request) -> AsyncGenerator[bytes, None]:
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > MAX_MULTIPART_REQUEST_BYTES:
+            raise _MultipartRequestTooLarge(MULTIPART_REQUEST_LIMIT_ERROR)
+        yield chunk
+
+
+async def _parse_limited_multipart_form(request: Request) -> FormData:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "multipart/form-data":
+        _bad_request("content type must be multipart/form-data")
+    _validate_content_length(request)
+    # Starlette's max_part_size excludes file parts, so cap the source stream itself.
+    parser = MultiPartParser(
+        request.headers,
+        _limited_request_stream(request),
+        max_files=MAX_MULTIPART_FILES,
+        max_fields=1,
+        max_part_size=MAX_REQUEST_JSON_BYTES,
+    )
+    try:
+        return await parser.parse()
+    except _MultipartRequestTooLarge:
+        _request_too_large()
+    except MultiPartException as exc:
+        raise HTTPException(status_code=400, detail={"error": exc.message}) from exc
+
+
+async def _parse_chat_stream_form(form: FormData) -> ChatStreamCommand:
     items = list(form.multi_items())
     uploads = [value for _, value in items if isinstance(value, UploadFile)]
     try:
@@ -273,3 +330,8 @@ async def parse_chat_stream_request(request: Request) -> ChatStreamCommand:
         )
     finally:
         await _close_uploads(uploads)
+
+
+async def parse_chat_stream_request(request: Request) -> ChatStreamCommand:
+    form = await _parse_limited_multipart_form(request)
+    return await _parse_chat_stream_form(form)
