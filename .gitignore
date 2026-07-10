@@ -17,6 +17,7 @@ docker-compose-local.yml
 
 .claude/settings.local.json
 .superpowers/
+.worktrees/
 
 # Environment variables
 .env
