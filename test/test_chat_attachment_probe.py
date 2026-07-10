@@ -12,6 +12,7 @@ import pytest
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_file_attachment" / "pdf-upload.json"
+FIXTURE_SHA256 = "0123456789abcdef" * 4
 
 
 def _load_fixture() -> dict[str, Any]:
@@ -213,6 +214,7 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                     "file_size": 321,
                     "mime_type": "application/pdf",
                     "use_case": "multimodal",
+                    "sha256": FIXTURE_SHA256,
                 },
             },
             "response": {
@@ -315,6 +317,7 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                                         "mime_type": "application/pdf",
                                         "size": 321,
                                         "auth_token": "attachment-auth-secret",
+                                        "sha256": FIXTURE_SHA256,
                                     }
                                 ]
                             },
@@ -343,6 +346,8 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
     assert fixture["blob_upload"]["request"]["url"] == "<signed-upload-url-redacted>"
     assert fixture["conversation"]["content_part"]["content_type"] == "text"
     assert fixture["conversation"]["metadata_attachment"]["mime_type"] == "application/pdf"
+    assert fixture["create_file"]["request"]["body"]["sha256"] == FIXTURE_SHA256
+    assert fixture["conversation"]["metadata_attachment"]["sha256"] == FIXTURE_SHA256
     assert [item["status"] for item in fixture["processing_status"]] == [
         "file.processing.started",
         "file.processing.metadata",
@@ -393,6 +398,19 @@ def test_sanitizer_redacts_uuidv7() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "opaque_identifier",
+    ["ab" * 16, "cd" * 20, "ef" * 32],
+)
+def test_sanitizer_redacts_contiguous_hex_identifiers(opaque_identifier: str) -> None:
+    from scripts.probe_chat_file_attachment import _redact_string
+
+    assert (
+        _redact_string(f"trace_{opaque_identifier}_end", {})
+        == "trace_<opaque-hex-id-redacted>_end"
+    )
+
+
 def test_validator_rejects_leftover_sensitive_response_identifier() -> None:
     from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
 
@@ -437,6 +455,41 @@ def test_validator_rejects_uuidv7_in_allowed_string() -> None:
 
     with pytest.raises(ProbeFailed, match="identifier"):
         _validate_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    "opaque_identifier",
+    ["ab" * 16, "cd" * 20, "ef" * 32],
+)
+def test_validator_rejects_contiguous_hex_identifiers(opaque_identifier: str) -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["create_file"]["response"]["body"]["status"] = (
+        f"success trace_{opaque_identifier}_end"
+    )
+
+    with pytest.raises(ProbeFailed, match="identifier"):
+        _validate_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("create_file", "request", "body", "sha256"),
+        ("conversation", "metadata_attachment", "sha256"),
+    ],
+)
+def test_validator_allows_explicit_sha256_fields(path: tuple[str, ...]) -> None:
+    from scripts.probe_chat_file_attachment import _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    target: Any = fixture
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = FIXTURE_SHA256
+
+    _validate_fixture(fixture)
 
 
 @pytest.mark.parametrize(

@@ -54,6 +54,8 @@ UUID_RE = re.compile(
     r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])",
     re.IGNORECASE,
 )
+OPAQUE_HEX_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32,}(?![0-9a-f])", re.IGNORECASE)
+SHA256_RE = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
 JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?")
 BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]+=*", re.IGNORECASE)
 FILE_ID_RE = re.compile(r"(?<!<)\bfile[-_][A-Za-z0-9_-]{6,}\b(?!>)")
@@ -74,6 +76,11 @@ VALIDATION_UUID_RE = re.compile(
     r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])",
     re.IGNORECASE,
 )
+VALIDATION_OPAQUE_HEX_RE = re.compile(
+    r"(?<![0-9a-f])[0-9a-f]{32,}(?![0-9a-f])",
+    re.IGNORECASE,
+)
+VALIDATION_SHA256_RE = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
 VALIDATION_FILE_ID_RE = re.compile(
     r"(?<!<)\bfile[-_][A-Za-z0-9_-]{6,}\b(?!>)",
     re.IGNORECASE,
@@ -125,6 +132,7 @@ CREATE_REQUEST_BODY_FIELDS = {
     "mime_resolution_source",
     "store_in_library",
     "library_persistence_mode",
+    "sha256",
 }
 CREATE_RESPONSE_BODY_FIELDS = {"status", "file_id", "upload_url", "library_file_id"}
 CONFIRMATION_RESPONSE_BODY_FIELDS = {"status", "success", "file_id"}
@@ -163,6 +171,11 @@ ATTACHMENT_FIELDS = {
     "library_persistence_reason",
     "non_library_my_files_injest_upload",
     "is_big_paste",
+    "sha256",
+}
+ALLOWED_SHA256_PATHS = {
+    ("create_file", "request", "body", "sha256"),
+    ("conversation", "metadata_attachment", "sha256"),
 }
 PROCESSING_TERMINAL_FAILURES = {
     "error",
@@ -342,7 +355,12 @@ def _looks_like_signed_url(value: str) -> bool:
     return bool(query_keys & SIGNED_QUERY_KEYS)
 
 
-def _redact_string(value: str, replacements: dict[str, str]) -> str:
+def _redact_string(
+    value: str,
+    replacements: dict[str, str],
+    *,
+    path: tuple[str | int, ...] = (),
+) -> str:
     redacted = value
     for secret, placeholder in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
         if secret:
@@ -359,6 +377,8 @@ def _redact_string(value: str, replacements: dict[str, str]) -> str:
     redacted = JWT_RE.sub("<credential-redacted>", redacted)
     redacted = UUID_RE.sub("<uuid-redacted>", redacted)
     redacted = FILE_ID_RE.sub("<file-id-redacted>", redacted)
+    if not (path in ALLOWED_SHA256_PATHS and SHA256_RE.fullmatch(redacted)):
+        redacted = OPAQUE_HEX_RE.sub("<opaque-hex-id-redacted>", redacted)
     return redacted
 
 
@@ -366,9 +386,18 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _sanitize_scalar(value: Any, replacements: dict[str, str]) -> Any:
+def _sanitize_scalar(
+    value: Any,
+    replacements: dict[str, str],
+    *,
+    path: tuple[str | int, ...] = (),
+) -> Any:
     if isinstance(value, str):
-        return _redact_string(value, replacements)
+        return _redact_string(
+            value,
+            replacements,
+            path=path,
+        )
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return None
@@ -378,13 +407,15 @@ def _project_fields(
     value: Any,
     allowed_fields: set[str],
     replacements: dict[str, str],
+    *,
+    path: tuple[str | int, ...],
 ) -> dict[str, Any]:
     source = _as_dict(value)
     projected: dict[str, Any] = {}
     for key in sorted(allowed_fields):
         if key not in source:
             continue
-        sanitized = _sanitize_scalar(source[key], replacements)
+        sanitized = _sanitize_scalar(source[key], replacements, path=(*path, key))
         if sanitized is not None or source[key] is None:
             projected[key] = sanitized
     return projected
@@ -410,7 +441,7 @@ def _project_content(value: Any, replacements: dict[str, str]) -> dict[str, Any]
     parts = source.get("parts")
     projected_parts: list[Any] = []
     if isinstance(parts, list):
-        for part in parts:
+        for index, part in enumerate(parts):
             if isinstance(part, str):
                 projected_parts.append(_redact_string(part, replacements))
             elif isinstance(part, dict):
@@ -419,6 +450,7 @@ def _project_content(value: Any, replacements: dict[str, str]) -> dict[str, Any]
                         part,
                         {"content_type", "asset_pointer", "size_bytes", "width", "height"},
                         replacements,
+                        path=("conversation", "content_part", "parts", index),
                     )
                 )
     return {
@@ -431,11 +463,22 @@ def _project_processing_events(value: Any, replacements: dict[str, str]) -> list
     if not isinstance(value, list):
         return []
     projected: list[dict[str, Any]] = []
-    for event in value:
+    for index, event in enumerate(value):
         if not isinstance(event, dict):
             continue
-        item = _project_fields(event, PROCESSING_EVENT_FIELDS, replacements)
-        extra = _project_fields(event.get("extra"), PROCESSING_EXTRA_FIELDS, replacements)
+        event_path = ("processing", "response", "events", index)
+        item = _project_fields(
+            event,
+            PROCESSING_EVENT_FIELDS,
+            replacements,
+            path=event_path,
+        )
+        extra = _project_fields(
+            event.get("extra"),
+            PROCESSING_EXTRA_FIELDS,
+            replacements,
+            path=(*event_path, "extra"),
+        )
         if extra:
             item["extra"] = extra
         if item:
@@ -542,6 +585,7 @@ def build_sanitized_fixture(raw_capture: dict[str, Any]) -> dict[str, Any]:
                     create_request.get("body"),
                     CREATE_REQUEST_BODY_FIELDS,
                     replacements,
+                    path=("create_file", "request", "body"),
                 ),
             },
             "response": {
@@ -550,6 +594,7 @@ def build_sanitized_fixture(raw_capture: dict[str, Any]) -> dict[str, Any]:
                     create_response.get("body"),
                     CREATE_RESPONSE_BODY_FIELDS,
                     replacements,
+                    path=("create_file", "response", "body"),
                 ),
             },
         },
@@ -582,6 +627,7 @@ def build_sanitized_fixture(raw_capture: dict[str, Any]) -> dict[str, Any]:
                     confirmation_response.get("body"),
                     CONFIRMATION_RESPONSE_BODY_FIELDS,
                     replacements,
+                    path=("uploaded_confirmation", "response", "body"),
                 ),
             },
         },
@@ -598,6 +644,7 @@ def build_sanitized_fixture(raw_capture: dict[str, Any]) -> dict[str, Any]:
                     processing_request.get("body"),
                     PROCESSING_REQUEST_BODY_FIELDS,
                     replacements,
+                    path=("processing", "request", "body"),
                 ),
             },
             "response": {
@@ -619,6 +666,7 @@ def build_sanitized_fixture(raw_capture: dict[str, Any]) -> dict[str, Any]:
                 attachments[0],
                 ATTACHMENT_FIELDS,
                 replacements,
+                path=("conversation", "metadata_attachment"),
             ),
             "response": {
                 "status_code": conversation_response.get("status_code")
@@ -656,6 +704,20 @@ def _all_strings(value: Any) -> Iterable[str]:
             yield from _all_strings(nested)
     elif isinstance(value, str):
         yield value
+
+
+def _all_string_paths(
+    value: Any,
+    path: tuple[str | int, ...] = (),
+) -> Iterable[tuple[tuple[str | int, ...], str]]:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            yield from _all_string_paths(nested, (*path, str(key)))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            yield from _all_string_paths(nested, (*path, index))
+    elif isinstance(value, str):
+        yield path, value
 
 
 def _validation_collapsed_key(key: object) -> str:
@@ -712,7 +774,18 @@ def _validation_contains_credential_text(value: str) -> bool:
 
 
 def _validation_contains_opaque_identifier(value: str) -> bool:
-    return bool(VALIDATION_UUID_RE.search(value) or VALIDATION_FILE_ID_RE.search(value))
+    return bool(
+        VALIDATION_UUID_RE.search(value)
+        or VALIDATION_FILE_ID_RE.search(value)
+        or VALIDATION_OPAQUE_HEX_RE.search(value)
+    )
+
+
+def _validation_is_allowed_sha256(
+    path: tuple[str | int, ...],
+    value: str,
+) -> bool:
+    return path in ALLOWED_SHA256_PATHS and bool(VALIDATION_SHA256_RE.fullmatch(value))
 
 
 def _require_fixture(condition: bool, path: str) -> None:
@@ -766,6 +839,16 @@ def _require_optional_redacted_identifier(
         _require_fixture(value == placeholder, f"{path}.{key} must be redacted")
 
 
+def _require_optional_sha256(mapping: dict[str, Any], path: str) -> None:
+    if "sha256" not in mapping:
+        return
+    value = mapping["sha256"]
+    _require_fixture(
+        isinstance(value, str) and bool(VALIDATION_SHA256_RE.fullmatch(value)),
+        f"{path}.sha256",
+    )
+
+
 def _validate_fixture(fixture: dict[str, Any]) -> None:
     if not isinstance(fixture, dict):
         raise ProbeFailed("sanitized fixture contract violation: root must be an object")
@@ -775,7 +858,11 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
         raise ProbeFailed("sanitized fixture still contains sensitive response identifiers")
     if any(_validation_contains_credential_text(value) for value in _all_strings(fixture)):
         raise ProbeFailed("sanitized fixture contains credential or signed URL")
-    if any(_validation_contains_opaque_identifier(value) for value in _all_strings(fixture)):
+    if any(
+        _validation_contains_opaque_identifier(value)
+        and not _validation_is_allowed_sha256(path, value)
+        for path, value in _all_string_paths(fixture)
+    ):
         raise ProbeFailed("sanitized fixture still contains an opaque identifier")
 
     root = _require_keys(
@@ -835,6 +922,7 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
         "create_file.request.body.file_size",
     )
     _require_fixture(create_request_body["mime_type"] == PDF_MIME_TYPE, "create_file.request.body.mime_type")
+    _require_optional_sha256(create_request_body, "create_file.request.body")
     create_response = _require_keys(
         create["response"],
         allowed={"status_code", "body"},
@@ -1065,6 +1153,7 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
     _require_fixture(attachment["id"] == "<file-id-redacted>", "conversation.metadata_attachment.id")
     _require_fixture(attachment["name"] == PROBE_FILE_NAME, "conversation.metadata_attachment.name")
     _require_fixture(attachment["mime_type"] == PDF_MIME_TYPE, "conversation.metadata_attachment.mime_type")
+    _require_optional_sha256(attachment, "conversation.metadata_attachment")
     _require_optional_redacted_identifier(
         attachment,
         "library_file_id",
