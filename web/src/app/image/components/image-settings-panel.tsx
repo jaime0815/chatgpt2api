@@ -265,6 +265,7 @@ export function ImageSettingsPanel({
     <Popover open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>{trigger}</PopoverTrigger>
       <PopoverContent
+        aria-label="图像设置"
         side="top"
         align="start"
         sideOffset={8}

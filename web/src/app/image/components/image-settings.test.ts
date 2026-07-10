@@ -150,10 +150,11 @@ describe("ImageSettingsPanel", () => {
     )
 
     expect(screen.getByRole("heading", { name: "图像设置" })).toBeInTheDocument()
-    expect(screen.getByRole("heading", { name: "图像设置" }).closest('[data-slot="popover-content"]')).toHaveAttribute(
-      "data-side",
-      "top",
-    )
+    const popover = screen
+      .getByRole("heading", { name: "图像设置" })
+      .closest('[data-slot="popover-content"]')
+    expect(popover).toHaveAttribute("data-side", "top")
+    expect(popover).toHaveAttribute("aria-label", "图像设置")
     expect(screen.getByRole("button", { name: "16:9(2k)" })).toBeDisabled()
 
     fireEvent.click(screen.getByRole("button", { name: "高" }))
