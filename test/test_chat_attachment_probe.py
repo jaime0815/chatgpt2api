@@ -375,6 +375,24 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
         assert opaque_identifier not in serialized
 
 
+def test_sanitizer_redacts_complete_url_safe_bearer_token() -> None:
+    from scripts.probe_chat_file_attachment import _redact_string
+
+    assert (
+        _redact_string("Bearer abc+VERYSECRETPART/==", {})
+        == "<credential-redacted>"
+    )
+
+
+def test_sanitizer_redacts_uuidv7() -> None:
+    from scripts.probe_chat_file_attachment import _redact_string
+
+    assert (
+        _redact_string("request_01890f4e-7b2a-7cc0-98c4-dc0c0c07398f_trace", {})
+        == "request_<uuid-redacted>_trace"
+    )
+
+
 def test_validator_rejects_leftover_sensitive_response_identifier() -> None:
     from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
 
@@ -394,6 +412,54 @@ def test_validator_rejects_unknown_credential_key() -> None:
     fixture["create_file"]["response"]["body"]["sessionToken"] = "opaque-session-secret"
 
     with pytest.raises(ProbeFailed, match="credential"):
+        _validate_fixture(fixture)
+
+
+def test_validator_rejects_credential_placeholder_suffix() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["create_file"]["response"]["body"]["status"] = (
+        "<credential-redacted>+VERYSECRETPART/=="
+    )
+
+    with pytest.raises(ProbeFailed, match="credential"):
+        _validate_fixture(fixture)
+
+
+def test_validator_rejects_uuidv7_in_allowed_string() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["create_file"]["response"]["body"]["status"] = (
+        "success request_01890f4e-7b2a-7cc0-98c4-dc0c0c07398f_trace"
+    )
+
+    with pytest.raises(ProbeFailed, match="identifier"):
+        _validate_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ("path", "failure_status"),
+    [
+        (("processing", "response", "events", 0, "status"), "failed"),
+        (("processing", "response", "events", 0, "status"), "file.processing.error"),
+        (("processing_status", 0, "status"), "cancelled"),
+    ],
+)
+def test_validator_rejects_processing_terminal_statuses(
+    path: tuple[str | int, ...],
+    failure_status: str,
+) -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    target: Any = fixture
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = failure_status
+
+    with pytest.raises(ProbeFailed, match="terminal failure"):
         _validate_fixture(fixture)
 
 
@@ -606,5 +672,103 @@ def test_malformed_create_response_reports_create_stage(monkeypatch, capsys) -> 
     try:
         raw_capture = json.loads(raw_path.read_text(encoding="utf-8"))
         assert raw_capture["failure"] == {"stage": "create_file", "status_code": None}
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+
+def test_processing_failure_status_stops_live_probe(monkeypatch, capsys) -> None:
+    from scripts import probe_chat_file_attachment as probe
+
+    class FakeResponse:
+        headers: dict[str, str] = {}
+        text = ""
+
+        def __init__(
+            self,
+            status_code: int,
+            *,
+            body: dict[str, Any] | None = None,
+            events: list[dict[str, Any]] | None = None,
+        ) -> None:
+            self.status_code = status_code
+            self._body = body or {}
+            self._events = events or []
+
+        def json(self) -> dict[str, Any]:
+            return self._body
+
+        def iter_lines(self) -> list[bytes]:
+            return [
+                f"data: {json.dumps(event)}".encode("utf-8")
+                for event in self._events
+            ]
+
+        def close(self) -> None:
+            return None
+
+    class FakeSession:
+        @staticmethod
+        def post(url: str, *args, **kwargs) -> FakeResponse:
+            if url.endswith("/backend-api/files"):
+                return FakeResponse(
+                    200,
+                    body={
+                        "file_id": "file-real-secret",
+                        "upload_url": "https://storage.invalid/upload?sig=secret",
+                    },
+                )
+            if url.endswith("/uploaded"):
+                return FakeResponse(200, body={"status": "success"})
+            if url.endswith("/process_upload_stream"):
+                return FakeResponse(
+                    200,
+                    events=[
+                        {
+                            "event": "file.processing.update",
+                            "status": "failed",
+                            "progress": 50,
+                        }
+                    ],
+                )
+            raise AssertionError(f"unexpected POST {url}")
+
+        @staticmethod
+        def put(*args, **kwargs) -> FakeResponse:
+            return FakeResponse(201)
+
+    class FakeClient:
+        base_url = "https://chatgpt.com"
+        user_agent = "fixture-test"
+        session = FakeSession()
+
+        @staticmethod
+        def _headers(path: str, extra: dict[str, str]) -> dict[str, str]:
+            return dict(extra)
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    with tempfile.NamedTemporaryFile(prefix="chat-attachment-probe-", suffix=".pdf", dir="/tmp") as pdf:
+        pdf.write(b"%PDF-1.4\n%%EOF\n")
+        pdf.flush()
+        monkeypatch.setenv("CHAT_ATTACHMENT_PROBE_PDF", pdf.name)
+        result = probe.main(
+            token_selector=lambda: "isolated-test-token",
+            client_factory=lambda token: FakeClient(),
+        )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    raw_match = re.search(r"raw_capture=(/tmp/[^\s]+\.json)", captured.err)
+    assert raw_match is not None
+    raw_path = Path(raw_match.group(1))
+    try:
+        assert "FAILED: stage=process_upload_stream status=unknown raw_capture=/tmp/" in captured.err
+        raw_capture = json.loads(raw_path.read_text(encoding="utf-8"))
+        assert raw_capture["failure"] == {
+            "stage": "process_upload_stream",
+            "status_code": None,
+        }
     finally:
         raw_path.unlink(missing_ok=True)

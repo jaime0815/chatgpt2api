@@ -51,20 +51,27 @@ SIGNED_QUERY_KEYS = {
     "access_token",
 }
 UUID_RE = re.compile(
-    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])",
     re.IGNORECASE,
 )
 JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?")
-BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~-]+", re.IGNORECASE)
+BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]+=*", re.IGNORECASE)
 FILE_ID_RE = re.compile(r"(?<!<)\bfile[-_][A-Za-z0-9_-]{6,}\b(?!>)")
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
-VALIDATION_BEARER_RE = re.compile(r"\bBearer\s+[^\s,;]+", re.IGNORECASE)
+VALIDATION_BEARER_RE = re.compile(
+    r"\bBearer\s+[A-Za-z0-9._~+/\-]+=*",
+    re.IGNORECASE,
+)
+VALIDATION_CREDENTIAL_SUFFIX_RE = re.compile(
+    r"<credential-redacted>[A-Za-z0-9._~+/\-=]+",
+    re.IGNORECASE,
+)
 VALIDATION_JWT_RE = re.compile(
     r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?"
 )
 VALIDATION_UUID_RE = re.compile(
-    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])",
     re.IGNORECASE,
 )
 VALIDATION_FILE_ID_RE = re.compile(
@@ -156,6 +163,14 @@ ATTACHMENT_FIELDS = {
     "library_persistence_reason",
     "non_library_my_files_injest_upload",
     "is_big_paste",
+}
+PROCESSING_TERMINAL_FAILURES = {
+    "error",
+    "failed",
+    "failure",
+    "cancelled",
+    "canceled",
+    "unknown",
 }
 
 
@@ -436,6 +451,20 @@ def _first_message(raw_capture: dict[str, Any]) -> dict[str, Any]:
     return messages[0]
 
 
+def _processing_state_is_failure(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return bool(normalized) and normalized.rsplit(".", 1)[-1] in PROCESSING_TERMINAL_FAILURES
+
+
+def _processing_event_has_failure(event: Any) -> bool:
+    return isinstance(event, dict) and any(
+        _processing_state_is_failure(event.get(key))
+        for key in ("event", "status")
+    )
+
+
 def _processing_status(events: list[Any], replacements: dict[str, str]) -> list[dict[str, Any]]:
     statuses: list[dict[str, Any]] = []
     for event in events:
@@ -661,7 +690,11 @@ def _validation_is_sensitive_identifier_key(key: object) -> bool:
 
 
 def _validation_contains_credential_text(value: str) -> bool:
-    if VALIDATION_BEARER_RE.search(value) or VALIDATION_JWT_RE.search(value):
+    if (
+        VALIDATION_BEARER_RE.search(value)
+        or VALIDATION_CREDENTIAL_SUFFIX_RE.search(value)
+        or VALIDATION_JWT_RE.search(value)
+    ):
         return True
     if VALIDATION_CREDENTIAL_ASSIGNMENT_RE.search(value):
         return True
@@ -956,6 +989,10 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
             required=set(),
             path=f"processing.response.events[{index}]",
         )
+        _require_fixture(
+            not _processing_event_has_failure(event_mapping),
+            f"processing.response.events[{index}] must not contain terminal failure",
+        )
         if "extra" in event_mapping:
             event_extra = _require_keys(
                 event_mapping["extra"],
@@ -973,11 +1010,15 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
     processing_status = root["processing_status"]
     _require_fixture(isinstance(processing_status, list) and bool(processing_status), "processing_status")
     for index, status in enumerate(processing_status):
-        _require_keys(
+        status_mapping = _require_keys(
             status,
             allowed={"stage", "status", "progress"},
             required={"stage", "status"},
             path=f"processing_status[{index}]",
+        )
+        _require_fixture(
+            not _processing_state_is_failure(status_mapping["status"]),
+            f"processing_status[{index}] must not contain terminal failure",
         )
 
     conversation = _require_keys(
@@ -1328,12 +1369,7 @@ def run_live_probe(
                 stage=current_stage,
                 raw_path=raw_path,
             )
-        error_events = {
-            str(event.get("event") or "")
-            for event in processing_events
-            if str(event.get("event") or "").rsplit(".", 1)[-1] in {"error", "cancelled", "failed", "unknown"}
-        }
-        if error_events:
+        if any(_processing_event_has_failure(event) for event in processing_events):
             raise ProbeFailed(
                 "process_upload_stream reported a terminal failure",
                 stage=current_stage,
