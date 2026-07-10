@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 import pytest
 
+from services import chat_stream_service, openai_backend_api
 from services.chat_stream_service import ChatStreamSession
 from services.chat_types import ChatAttachmentBlob, ChatMessage, ChatStreamCommand
 from services.openai_backend_api import InvalidAccessTokenError
@@ -64,6 +65,7 @@ class FakeBackend:
         self.stream_calls: list[dict[str, Any]] = []
         self.closed = False
         self.close_calls = 0
+        self.cancel_active_response_calls = 0
 
     def stream_conversation(self, **kwargs: Any) -> TrackingIterator:
         self.stream_calls.append(kwargs)
@@ -72,6 +74,9 @@ class FakeBackend:
     def close(self) -> None:
         self.close_calls += 1
         self.closed = True
+
+    def cancel_active_response(self) -> None:
+        self.cancel_active_response_calls += 1
 
 
 class BackendFactory:
@@ -306,6 +311,29 @@ def test_invalid_token_after_first_delta_is_not_replayed() -> None:
     assert factory.backends[0].close_calls == 1
 
 
+def test_local_uploader_token_text_does_not_retry_healthy_account() -> None:
+    local_error = RuntimeError("local uploader rejected token_invalidated metadata text")
+    factory = BackendFactory({
+        "token-a": [TrackingIterator([])],
+        "token-b": [TrackingIterator([])],
+    })
+    accounts = FakeAccountProvider(["token-a", "token-b"])
+
+    with pytest.raises(RuntimeError, match="local uploader rejected"):
+        list(ChatStreamSession(
+            _command(),
+            account_provider=accounts,
+            backend_factory=factory,
+            attachment_uploader=FakeAttachmentUploader(error=local_error),
+        ))
+
+    assert len(factory.backends) == 1
+    assert accounts.refresh_calls == []
+    assert accounts.remove_calls == []
+    assert accounts.get_calls == [set()]
+    assert factory.backends[0].close_calls == 1
+
+
 def test_empty_stream_eof_is_truncated_without_marking_success() -> None:
     stream = TrackingIterator([])
     factory = BackendFactory({"token-a": [stream]})
@@ -426,6 +454,7 @@ def test_cancel_is_thread_safe_idempotent_and_never_emits_stop() -> None:
     assert accounts.mark_calls == []
     assert stream.close_calls == 1
     assert factory.backends[0].close_calls == 1
+    assert factory.backends[0].cancel_active_response_calls == 1
 
 
 def test_cancel_closes_resources_while_stream_iterator_is_blocked() -> None:
@@ -446,6 +475,148 @@ def test_cancel_closes_resources_while_stream_iterator_is_blocked() -> None:
 
     assert stream.close_calls == 1
     assert factory.backends[0].close_calls == 1
+
+
+def test_cancel_during_delta_chunk_construction_does_not_yield_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    released = threading.Event()
+    original_completion_chunk = chat_stream_service.completion_chunk
+
+    def blocking_completion_chunk(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        delta = args[1]
+        if isinstance(delta, dict) and delta.get("content") == "partial":
+            entered.set()
+            released.wait(timeout=2)
+        return original_completion_chunk(*args, **kwargs)
+
+    monkeypatch.setattr(chat_stream_service, "completion_chunk", blocking_completion_chunk)
+    stream = TrackingIterator([_delta("partial"), "[DONE]"])
+    factory = BackendFactory({"token-a": [stream]})
+    session = ChatStreamSession(
+        _command(),
+        account_provider=FakeAccountProvider(["token-a"]),
+        backend_factory=factory,
+        attachment_uploader=FakeAttachmentUploader(),
+    )
+    iterator = iter(session)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(next, iterator)
+        assert entered.wait(timeout=2)
+        session.cancel()
+        released.set()
+        with pytest.raises(StopIteration):
+            result.result(timeout=2)
+
+
+def test_cancel_during_stop_chunk_construction_does_not_yield_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    released = threading.Event()
+    original_completion_chunk = chat_stream_service.completion_chunk
+
+    def blocking_completion_chunk(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if args[2] == "stop":
+            entered.set()
+            released.wait(timeout=2)
+        return original_completion_chunk(*args, **kwargs)
+
+    monkeypatch.setattr(chat_stream_service, "completion_chunk", blocking_completion_chunk)
+    stream = TrackingIterator(["[DONE]"])
+    session = ChatStreamSession(
+        _command(),
+        account_provider=FakeAccountProvider(["token-a"]),
+        backend_factory=BackendFactory({"token-a": [stream]}),
+        attachment_uploader=FakeAttachmentUploader(),
+    )
+    iterator = iter(session)
+
+    first = next(iterator)
+    assert first["choices"][0]["finish_reason"] is None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(next, iterator)
+        assert entered.wait(timeout=2)
+        session.cancel()
+        released.set()
+        with pytest.raises(StopIteration):
+            result.result(timeout=2)
+
+
+class BlockingStreamResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.released = threading.Event()
+        self._lock = threading.Lock()
+        self.closed = False
+        self.close_calls = 0
+
+    def iter_lines(self) -> Iterable[bytes]:
+        self.started.set()
+        self.released.wait()
+        return
+        yield b""  # pragma: no cover
+
+    def close(self) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+            self.close_calls += 1
+            self.released.set()
+
+
+class FakeCurlSession:
+    def __init__(self, response: BlockingStreamResponse) -> None:
+        self.response = response
+        self.headers: dict[str, str] = {}
+        self.close_calls = 0
+
+    def post(self, *_args: Any, **_kwargs: Any) -> BlockingStreamResponse:
+        return self.response
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_session_cancel_closes_active_backend_response_and_releases_blocked_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = BlockingStreamResponse()
+    fake_session = FakeCurlSession(response)
+    monkeypatch.setattr(openai_backend_api.requests, "Session", lambda **_kwargs: fake_session)
+    backend = openai_backend_api.OpenAIBackendAPI()
+    monkeypatch.setattr(backend, "_bootstrap", lambda: None)
+    monkeypatch.setattr(backend, "_get_chat_requirements", lambda: object())
+    monkeypatch.setattr(backend, "_chat_target", lambda: ("/stream", "UTC"))
+    monkeypatch.setattr(backend, "_conversation_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(backend, "_conversation_headers", lambda *_args, **_kwargs: {})
+    command = _command(
+        messages=(ChatMessage("message-1", "user", "Hello", ()),),
+        attachments=(),
+    )
+    session = ChatStreamSession(
+        command,
+        account_provider=FakeAccountProvider(["token-a"]),
+        backend_factory=lambda _token: backend,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(lambda: list(session))
+        assert response.started.wait(timeout=2)
+        session.cancel()
+        try:
+            assert result.result(timeout=1) == []
+        finally:
+            response.close()
+
+    assert response.close_calls == 1
+    assert fake_session.close_calls == 1
 
 
 def test_text_only_success_does_not_require_attachment_uploader() -> None:

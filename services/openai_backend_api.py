@@ -4,6 +4,7 @@ import mimetypes
 import os
 import random
 import re
+import threading
 import time
 
 import urllib.error
@@ -167,6 +168,9 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        self._active_response_lock = threading.Lock()
+        self._active_stream_response: Any | None = None
+        self._closed = False
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
@@ -202,15 +206,63 @@ class OpenAIBackendAPI:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
     def close(self) -> None:
-        if getattr(self, "_closed", False):
-            return
-        self._closed = True
+        lock = getattr(self, "_active_response_lock", None)
+        response = None
+        if lock is None:
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+        else:
+            with lock:
+                if self._closed:
+                    return
+                self._closed = True
+                response = self._active_stream_response
+                self._active_stream_response = None
+        self._close_stream_response(response)
         session = getattr(self, "session", None)
         if session:
             try:
                 session.close()
             except Exception:
                 pass
+
+    def cancel_active_response(self) -> bool:
+        lock = getattr(self, "_active_response_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            response = self._active_stream_response
+            self._active_stream_response = None
+        if response is None:
+            return False
+        self._close_stream_response(response)
+        return True
+
+    def _register_active_response(self, response: Any) -> bool:
+        with self._active_response_lock:
+            if self._closed:
+                return False
+            if self._active_stream_response is not None:
+                raise RuntimeError("backend already has an active streaming response")
+            self._active_stream_response = response
+            return True
+
+    def _release_active_response(self, response: Any) -> bool:
+        with self._active_response_lock:
+            if self._active_stream_response is not response:
+                return False
+            self._active_stream_response = None
+            return True
+
+    @staticmethod
+    def _close_stream_response(response: Any | None) -> None:
+        if response is None:
+            return
+        try:
+            response.close()
+        except Exception:
+            pass
 
     def __del__(self):
         self.close()
@@ -2556,11 +2608,16 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
+        registered = False
         try:
+            ensure_ok(response, path)
+            registered = self._register_active_response(response)
+            if not registered:
+                return
             yield from iter_sse_payloads(response)
         finally:
-            response.close()
+            if not registered or self._release_active_response(response):
+                self._close_stream_response(response)
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""

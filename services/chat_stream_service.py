@@ -75,13 +75,10 @@ def _upstream_messages(
     return upstream
 
 
-def _is_invalid_token_exception(exc: Exception) -> bool:
-    message = str(exc or "").lower()
-    return (
-        isinstance(exc, InvalidAccessTokenError)
-        or is_token_invalid_error(message)
-        or "token invalidated" in message
-    )
+def _is_invalid_token_exception(exc: Exception, *, allow_message_match: bool) -> bool:
+    if isinstance(exc, InvalidAccessTokenError):
+        return True
+    return allow_message_match and is_token_invalid_error(str(exc or ""))
 
 
 class ChatStreamSession:
@@ -99,6 +96,7 @@ class ChatStreamSession:
         self._attachment_uploader = attachment_uploader
 
         self._lock = threading.RLock()
+        self._cancelled = threading.Event()
         self._started = False
         self._closed = False
         self._active_backend: Any | None = None
@@ -134,6 +132,7 @@ class ChatStreamSession:
             retry = False
             succeeded = False
             completed = False
+            conversation_started = False
             try:
                 backend = self._backend_factory(token)
                 if not self._activate_backend(backend):
@@ -144,6 +143,7 @@ class ChatStreamSession:
                 if self._is_closed():
                     return
 
+                conversation_started = True
                 upstream_iterator = backend.stream_conversation(
                     messages=messages,
                     model=self.command.model,
@@ -177,13 +177,16 @@ class ChatStreamSession:
                     if not emitted:
                         chunk_delta["role"] = "assistant"
                     emitted = True
-                    yield completion_chunk(
+                    chunk = completion_chunk(
                         self.command.model,
                         chunk_delta,
                         None,
                         completion_id,
                         created,
                     )
+                    if self._is_closed():
+                        return
+                    yield chunk
 
                 if self._is_closed():
                     return
@@ -194,7 +197,10 @@ class ChatStreamSession:
             except Exception as exc:
                 if self._is_closed():
                     return
-                if not emitted and token and _is_invalid_token_exception(exc):
+                if not emitted and token and _is_invalid_token_exception(
+                    exc,
+                    allow_message_match=conversation_started,
+                ):
                     replacement = self._replacement_token(token, attempted_tokens)
                     if replacement:
                         token = replacement
@@ -212,40 +218,49 @@ class ChatStreamSession:
                 if self._is_closed():
                     return
                 if not emitted:
-                    yield completion_chunk(
+                    chunk = completion_chunk(
                         self.command.model,
                         {"role": "assistant", "content": ""},
                         None,
                         completion_id,
                         created,
                     )
+                    if self._is_closed():
+                        return
+                    yield chunk
                 if self._is_closed():
                     return
-                yield completion_chunk(
+                chunk = completion_chunk(
                     self.command.model,
                     {},
                     "stop",
                     completion_id,
                     created,
                 )
+                if self._is_closed():
+                    return
+                yield chunk
                 return
 
     def cancel(self) -> None:
         self.close()
 
     def close(self) -> None:
+        self._cancelled.set()
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            backend = self._active_backend
             resources = (
+                backend,
                 self._active_upstream_iterator,
-                self._active_backend,
                 self._active_event_iterator,
             )
             self._active_event_iterator = None
             self._active_upstream_iterator = None
             self._active_backend = None
+        self._cancel_active_response(backend)
         for resource in resources:
             self._close_resource(resource)
 
@@ -257,8 +272,16 @@ class ChatStreamSession:
             return True
 
     def _is_closed(self) -> bool:
-        with self._lock:
-            return self._closed
+        return self._cancelled.is_set()
+
+    @staticmethod
+    def _cancel_active_response(backend: Any | None) -> None:
+        cancel = getattr(backend, "cancel_active_response", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
 
     def _activate_backend(self, backend: Any) -> bool:
         with self._lock:
