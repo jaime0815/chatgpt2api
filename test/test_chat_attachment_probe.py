@@ -9,6 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_file_attachment" / "pdf-upload.json"
 
@@ -109,6 +111,10 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
             },
             "response": {
                 "status_code": 200,
+                "headers": {
+                    "X-Request-Id": "req_01JZ/opaque+value==.7f",
+                    "Traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                },
                 "body": {
                     "file_id": "file-real-secret",
                     "upload_url": "https://example.blob.core.windows.net/a?sv=1&sig=secret",
@@ -126,7 +132,15 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                     "Authorization": "Bearer must-not-survive",
                 },
             },
-            "response": {"status_code": 201, "headers": {"ETag": "opaque-etag"}},
+            "response": {
+                "status_code": 201,
+                "headers": {
+                    "ETag": "W/\"0x8DBopaque:+/==\"",
+                    "x-ms-request-id": "7c1ef2d1-701e-0047-5f29-f0c057000000",
+                    "x-ms-version-id": "3LgOpa/que+Version==",
+                    "x-ms-blob-id": "blob::opaque/+/identifier==",
+                },
+            },
         },
         "uploaded_confirmation": {
             "request": {
@@ -134,7 +148,11 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                 "path": "/backend-api/files/file-real-secret/uploaded",
                 "body": {},
             },
-            "response": {"status_code": 200, "body": {"status": "success"}},
+            "response": {
+                "status_code": 200,
+                "headers": {"Operation-Id": "op_opaque/+/identifier=="},
+                "body": {"status": "success"},
+            },
         },
         "processing": {
             "request": {
@@ -145,11 +163,19 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
             "response": {
                 "status_code": 200,
                 "events": [
-                    {"event": "file.processing.started", "progress": 10},
+                    {
+                        "event": "file.processing.started",
+                        "progress": 10,
+                        "trace_id": "trace_opaque/+/identifier==",
+                    },
                     {
                         "event": "file.processing.metadata",
                         "progress": 100,
-                        "extra": {"mime_type": "application/pdf", "total_tokens": 42},
+                        "extra": {
+                            "mime_type": "application/pdf",
+                            "total_tokens": 42,
+                            "version_id": "version_opaque/+/identifier==",
+                        },
                     },
                 ],
             },
@@ -180,7 +206,13 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
             },
             "response": {
                 "status_code": 200,
-                "events": [{"conversation_id": "conversation-real-secret", "message": {"id": "reply-real-secret"}}],
+                "events": [
+                    {
+                        "conversation_id": "conversation-real-secret",
+                        "request_id": "req_conversation/+/opaque==",
+                        "message": {"id": "reply-real-secret"},
+                    }
+                ],
             },
         },
     }
@@ -202,6 +234,63 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
     assert "parent-real-secret" not in serialized
     assert "must-not-survive" not in serialized
     assert "sig=secret" not in serialized
+    for opaque_identifier in (
+        "req_01JZ/opaque+value==.7f",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "W/\"0x8DBopaque:+/==\"",
+        "7c1ef2d1-701e-0047-5f29-f0c057000000",
+        "3LgOpa/que+Version==",
+        "blob::opaque/+/identifier==",
+        "op_opaque/+/identifier==",
+        "trace_opaque/+/identifier==",
+        "version_opaque/+/identifier==",
+        "req_conversation/+/opaque==",
+    ):
+        assert opaque_identifier not in serialized
+
+
+def test_validator_rejects_leftover_sensitive_response_identifier() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = {
+        "capture_kind": "real_upstream",
+        "create_file": {
+            "request": {
+                "method": "POST",
+                "path": "/backend-api/files",
+                "body": {"file_name": "sample.pdf"},
+            },
+            "response": {
+                "status_code": 200,
+                "body": {"file_id": "<file-id-redacted>"},
+            },
+        },
+        "blob_upload": {
+            "request": {
+                "method": "PUT",
+                "url": "<signed-upload-url-redacted>",
+                "headers": {
+                    "Content-Type": "application/pdf",
+                    "x-ms-blob-type": "BlockBlob",
+                    "x-ms-version": "2020-04-08",
+                },
+            },
+            "response": {
+                "status_code": 201,
+                "headers": {"x-operation-id": "opaque.operation/id:+=="},
+            },
+        },
+        "uploaded_confirmation": {"response": {"status_code": 200}},
+        "processing_status": [{"stage": "process_upload_stream", "status": "file.processing.metadata"}],
+        "conversation": {
+            "content_part": {"content_type": "text", "parts": ["Inspect the PDF."]},
+            "metadata_attachment": {"mime_type": "application/pdf"},
+            "response": {"status_code": 200, "event_count": 1},
+        },
+    }
+
+    with pytest.raises(ProbeFailed, match="sensitive response identifiers"):
+        _validate_fixture(fixture)
 
 
 def test_direct_cli_reports_missing_account_as_blocked() -> None:

@@ -44,6 +44,16 @@ UUID_RE = re.compile(
 JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?")
 BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~-]+", re.IGNORECASE)
 FILE_ID_RE = re.compile(r"(?<!<)\bfile[-_][A-Za-z0-9_-]{6,}\b(?!>)")
+SENSITIVE_IDENTIFIER_KEY_PARTS = {
+    "requestid",
+    "traceid",
+    "spanid",
+    "correlationid",
+    "versionid",
+    "blobid",
+    "operationid",
+}
+SENSITIVE_IDENTIFIER_KEYS = {"etag", "traceparent", "tracestate"}
 
 
 class ProbeBlocked(RuntimeError):
@@ -198,12 +208,20 @@ def _redact_string(value: str, replacements: dict[str, str]) -> str:
     return redacted
 
 
+def _is_sensitive_identifier_key(key: object) -> bool:
+    collapsed = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return collapsed in SENSITIVE_IDENTIFIER_KEYS or any(
+        identifier in collapsed
+        for identifier in SENSITIVE_IDENTIFIER_KEY_PARTS
+    )
+
+
 def _redact_tree(value: Any, replacements: dict[str, str]) -> Any:
     if isinstance(value, dict):
         return {
             str(key): _redact_tree(nested, replacements)
             for key, nested in value.items()
-            if str(key).lower() not in SECRET_KEYS
+            if str(key).lower() not in SECRET_KEYS and not _is_sensitive_identifier_key(key)
         }
     if isinstance(value, list):
         return [_redact_tree(nested, replacements) for nested in value]
@@ -356,6 +374,8 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
     lower_keys = {key.lower() for key in _all_keys(fixture)}
     if lower_keys & SECRET_KEYS:
         raise ProbeFailed("sanitized fixture still contains credential keys")
+    if any(_is_sensitive_identifier_key(key) for key in _all_keys(fixture)):
+        raise ProbeFailed("sanitized fixture still contains sensitive response identifiers")
     if BEARER_RE.search(serialized) or JWT_RE.search(serialized):
         raise ProbeFailed("sanitized fixture still contains credentials")
     if any(_looks_like_signed_url(value) for value in _all_strings(fixture)):
