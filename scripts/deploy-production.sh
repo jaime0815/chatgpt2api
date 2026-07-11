@@ -194,9 +194,9 @@ declare -A current_image_ids=()
 add_image_ref() {
   local image_ref="$1"
 
-  [[ -n "$image_ref" ]] || return
+  [[ -n "$image_ref" ]] || return 0
   if [[ -n "${image_refs_seen[$image_ref]:-}" ]]; then
-    return
+    return 0
   fi
   image_refs_seen["$image_ref"]=1
   image_refs+=("$image_ref")

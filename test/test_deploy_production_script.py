@@ -116,6 +116,8 @@ def test_remote_execution_transmits_safe_update_and_cleanup_steps(tmp_path: Path
     assert 'compose -f "$compose_file" images -q' in v1_image_discovery
     assert "image:" in v1_image_discovery
     assert 'add_image_ref "chatgpt2api:local"' in v1_image_discovery
+    assert '[[ -n "$image_ref" ]] || return 0' in payload
+    assert 'if [[ -n "${image_refs_seen[$image_ref]:-}" ]]; then\n    return 0' in payload
     assert '"$deploy_path/scripts/docker-up.sh" --local --build' in payload
     assert "seed_host_mounts()" in payload
     assert 'compose -f "$compose_file" build --pull' in payload
