@@ -92,7 +92,12 @@ describe("useChatImageTasks", () => {
     const dependencies = createDependencies()
     const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
     const { result } = renderHook(() =>
-      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+      useChatImageTasks({
+        onMessageChange,
+        dependencies,
+        pollIntervalMs: 0,
+        authKey: "workspace-a-key",
+      }),
     )
 
     let message!: ChatMessage
@@ -131,6 +136,15 @@ describe("useChatImageTasks", () => {
       }),
     ))
     expect(dependencies.createImageEditTask).toHaveBeenCalledTimes(3)
+    expect(dependencies.createImageEditTask).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Array),
+      "draw a city",
+      SETTINGS.model,
+      "1536x1024",
+      SETTINGS.quality,
+      "workspace-a-key",
+    )
     expect(dependencies.createImageGenerationTask).not.toHaveBeenCalled()
     expect(JSON.stringify(onMessageChange.mock.calls)).not.toContain('"large"')
   })
@@ -149,14 +163,19 @@ describe("useChatImageTasks", () => {
       images: [{ id: "image-1", taskId: "persisted-task", status: "running" }],
     }
     const { result } = renderHook(() =>
-      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+      useChatImageTasks({
+        onMessageChange,
+        dependencies,
+        pollIntervalMs: 0,
+        authKey: "workspace-a-key",
+      }),
     )
 
     await act(async () => {
       await result.current.recoverImageMessages([existing])
     })
 
-    expect(dependencies.fetchImageTasks).toHaveBeenCalledWith(["persisted-task"])
+    expect(dependencies.fetchImageTasks).toHaveBeenCalledWith(["persisted-task"], "workspace-a-key")
     expect(onMessageChange).toHaveBeenLastCalledWith(
       expect.objectContaining({
         id: existing.id,
@@ -187,7 +206,12 @@ describe("useChatImageTasks", () => {
       }
     })
     const { result } = renderHook(() =>
-      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+      useChatImageTasks({
+        onMessageChange,
+        dependencies,
+        pollIntervalMs: 0,
+        authKey: "workspace-a-key",
+      }),
     )
 
     let submission!: Promise<ChatMessage>
@@ -241,7 +265,12 @@ describe("useChatImageTasks", () => {
       images: [{ id: "image-missing", taskId: "missing-task", status: "running" }],
     }
     const { result } = renderHook(() =>
-      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+      useChatImageTasks({
+        onMessageChange,
+        dependencies,
+        pollIntervalMs: 0,
+        authKey: "workspace-a-key",
+      }),
     )
 
     await act(async () => {
@@ -307,14 +336,23 @@ describe("useChatImageTasks", () => {
       images: [{ id: "image-timeout", taskId: "timed-out-task", status: "error", error: "生成超时" }],
     }
     const { result } = renderHook(() =>
-      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+      useChatImageTasks({
+        onMessageChange,
+        dependencies,
+        pollIntervalMs: 0,
+        authKey: "workspace-a-key",
+      }),
     )
 
     await act(async () => {
       await result.current.resumeImageTask(message, "timed-out-task")
     })
 
-    expect(dependencies.resumeImagePoll).toHaveBeenCalledWith("timed-out-task")
+    expect(dependencies.resumeImagePoll).toHaveBeenCalledWith(
+      "timed-out-task",
+      undefined,
+      "workspace-a-key",
+    )
     expect(onMessageChange).toHaveBeenLastCalledWith(
       expect.objectContaining({
         id: message.id,
@@ -338,7 +376,12 @@ describe("useChatImageTasks", () => {
       images: [{ id: "failed-image", taskId: "old-task", status: "error", error: "生成失败" }],
     }
     const { result } = renderHook(() =>
-      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+      useChatImageTasks({
+        onMessageChange,
+        dependencies,
+        pollIntervalMs: 0,
+        authKey: "workspace-a-key",
+      }),
     )
 
     await act(async () => {
@@ -357,6 +400,7 @@ describe("useChatImageTasks", () => {
       SETTINGS.model,
       "1536x1024",
       SETTINGS.quality,
+      "workspace-a-key",
     )
   })
 
@@ -385,6 +429,7 @@ describe("useChatImageTasks", () => {
         dependencies,
         pollIntervalMs: 0,
         resolveAttachments,
+        authKey: "workspace-a-key",
       }),
     )
 
@@ -396,7 +441,15 @@ describe("useChatImageTasks", () => {
       expect.objectContaining({ status: "complete" }),
     ))
     expect(resolveAttachments).toHaveBeenCalledWith(["stored-reference"])
-    expect(dependencies.createImageEditTask).toHaveBeenCalledOnce()
+    expect(dependencies.createImageEditTask).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Array),
+      "retry edit",
+      SETTINGS.model,
+      "1536x1024",
+      SETTINGS.quality,
+      "workspace-a-key",
+    )
   })
 
   it("keeps fulfilled tasks running when another task in the same batch fails to submit", async () => {

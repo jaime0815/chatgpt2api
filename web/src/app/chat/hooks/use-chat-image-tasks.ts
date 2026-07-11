@@ -66,6 +66,7 @@ export type ChatImageRetryInput = Pick<ChatImageTaskInput, "prompt" | "reference
 
 export type UseChatImageTasksOptions = {
   onMessageChange: (message: ChatMessage) => void | Promise<void>
+  authKey?: string
   dependencies?: Partial<ChatImageTaskDependencies>
   pollIntervalMs?: number
   resolveAttachments?: (
@@ -168,6 +169,7 @@ function snapshotToSettings(snapshot: ChatImageSettingsSnapshot): ImageSettings 
 
 export function useChatImageTasks({
   onMessageChange,
+  authKey,
   dependencies,
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   resolveAttachments,
@@ -179,6 +181,8 @@ export function useChatImageTasks({
   dependenciesRef.current = { ...DEFAULT_DEPENDENCIES, ...dependencies }
   const onMessageChangeRef = useRef(onMessageChange)
   onMessageChangeRef.current = onMessageChange
+  const authKeyRef = useRef(authKey)
+  authKeyRef.current = authKey
   const messagesRef = useRef(new Map<string, ChatMessage>())
   const pollersRef = useRef(new Map<string, Promise<void>>())
   const disposedRef = useRef(false)
@@ -233,7 +237,10 @@ export function useChatImageTasks({
           return
         }
         try {
-          const taskList = await dependenciesRef.current.fetchImageTasks(ids)
+          const workspaceAuthKey = String(authKeyRef.current || "").trim()
+          const taskList = workspaceAuthKey
+            ? await dependenciesRef.current.fetchImageTasks(ids, workspaceAuthKey)
+            : await dependenciesRef.current.fetchImageTasks(ids)
           firstRequest = false
           consecutiveErrors = 0
           const latest = messagesRef.current.get(messageId)
@@ -291,6 +298,7 @@ export function useChatImageTasks({
     ) => {
       try {
         const referenceFiles = settings.mode === "edit" ? taskFiles(references) : []
+        const workspaceAuthKey = String(authKeyRef.current || "").trim()
         if (settings.mode === "edit" && referenceFiles.length === 0) {
           throw new Error("未找到可用于编辑的参考图")
         }
@@ -304,21 +312,40 @@ export function useChatImageTasks({
             }
             const task =
               settings.mode === "edit"
-                ? await dependenciesRef.current.createImageEditTask(
-                    taskId,
-                    referenceFiles,
-                    prompt,
-                    settings.model,
-                    imageSize(settings),
-                    settings.quality,
-                  )
-                : await dependenciesRef.current.createImageGenerationTask(
-                    taskId,
-                    prompt,
-                    settings.model,
-                    imageSize(settings),
-                    settings.quality,
-                  )
+                ? workspaceAuthKey
+                  ? await dependenciesRef.current.createImageEditTask(
+                      taskId,
+                      referenceFiles,
+                      prompt,
+                      settings.model,
+                      imageSize(settings),
+                      settings.quality,
+                      workspaceAuthKey,
+                    )
+                  : await dependenciesRef.current.createImageEditTask(
+                      taskId,
+                      referenceFiles,
+                      prompt,
+                      settings.model,
+                      imageSize(settings),
+                      settings.quality,
+                    )
+                : workspaceAuthKey
+                  ? await dependenciesRef.current.createImageGenerationTask(
+                      taskId,
+                      prompt,
+                      settings.model,
+                      imageSize(settings),
+                      settings.quality,
+                      workspaceAuthKey,
+                    )
+                  : await dependenciesRef.current.createImageGenerationTask(
+                      taskId,
+                      prompt,
+                      settings.model,
+                      imageSize(settings),
+                      settings.quality,
+                    )
             return { placeholderId, task }
           }),
         )
@@ -427,7 +454,10 @@ export function useChatImageTasks({
   const resumeImageTask = useCallback(
     async (message: ChatMessage, taskId: string) => {
       messagesRef.current.set(message.id, message)
-      const task = await dependenciesRef.current.resumeImagePoll(taskId)
+      const workspaceAuthKey = String(authKeyRef.current || "").trim()
+      const task = workspaceAuthKey
+        ? await dependenciesRef.current.resumeImagePoll(taskId, undefined, workspaceAuthKey)
+        : await dependenciesRef.current.resumeImagePoll(taskId)
       const resumed: ChatMessage = {
         ...message,
         images: (message.images || []).map((image) =>
