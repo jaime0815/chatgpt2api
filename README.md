@@ -28,10 +28,11 @@ docker compose -f docker-compose.local.yml up -d --build
 启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.local.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
 - Web 面板：`http://localhost:8000/chatgpt2api/`
+- 普通用户聊天：`http://localhost:8000/chatgpt2api/chat/`（普通用户登录后的默认入口）
 - API 地址：`http://localhost:8000/chatgpt2api/v1`
 - 数据目录：`./data`
 
-Web 面板和同源 API 默认挂在 `/chatgpt2api` 子路径下，便于 nginx redirect/反向代理。页面、`/_next` 静态资源、public 图标和同源 `/api`、`/v1` 请求都会走同一前缀：
+Web 面板和同源 API 默认挂在 `/chatgpt2api` 子路径下，便于 nginx redirect/反向代理。普通用户登录后会进入该 `basePath` 下的 `/chat` 路由；按默认配置即为 `/chatgpt2api/chat/`。页面、`/_next` 静态资源、public 图标和同源 `/api`、`/v1` 请求都会走同一前缀：
 
 如果需要改成其他路径，可在构建时覆盖 `NEXT_PUBLIC_BASE_PATH`；预构建镜像的前端静态资源已在镜像构建时确定，改路径需要自构建镜像。
 
@@ -133,6 +134,33 @@ environment:
 - 支持服务端缓存图片URL
 - 图片生成进度追踪，超时后可继续等待
 - 图片懒加载与滚动位置记忆，优化大量图片场景性能
+
+### 普通用户聊天
+
+- 普通用户登录后默认进入 `/chat`，提供接近 ChatGPT 的多轮消息流界面和模型选择。
+- 文本流可在浏览器中停止；已完成或失败的助手回复可重试，用户消息可编辑后重新发送。
+- 聊天记录、当前会话、模型偏好和滚动位置只保存在当前浏览器，并按登录用户的 `subject_id` 分区；不会作为服务端聊天历史同步到其他浏览器或设备。
+- 图片生成/编辑模式复用既有画图工作台的模型、质量、尺寸/比例和生成数量设置。参考图最多 10 张，生成数量沿用既有的 `1-100` 参数范围。
+- 文本聊天附件（包括文档）尚未接入真实上游 uploader，不能视为已支持的能力。聊天页面会提示移除附件；若直接向 `/api/chat/stream` 发送附件，流会返回 `attachment_unavailable` 错误事件。PDF、Office 等文档不能用于当前普通文本聊天。
+
+#### 可选实时聊天附件冒烟测试
+
+该测试需要可访问的真实服务、Bearer 凭证和本地夹具；`LIVE_CHAT_BASE_URL` 必须包含反向代理的 `basePath`，例如默认的 `http://localhost:8000/chatgpt2api`。以下示例中的 `LIVE_CHAT_IMAGE_FILES` 要提供 10 个内容不同的图片路径，Linux/macOS 用 `:` 分隔（Windows 用 `;` 分隔）：
+
+```bash
+RUN_LIVE_CHAT_ATTACHMENTS=1 \
+LIVE_CHAT_BASE_URL=http://localhost:8000/chatgpt2api \
+LIVE_CHAT_AUTHORIZATION='Bearer <auth-key>' \
+LIVE_CHAT_MODEL=auto \
+LIVE_CHAT_TIMEOUT_SECONDS=90 \
+LIVE_CHAT_PDF=/absolute/path/to/sample.pdf \
+LIVE_CHAT_CSV=/absolute/path/to/sample.csv \
+LIVE_CHAT_DOCX=/absolute/path/to/sample.docx \
+LIVE_CHAT_IMAGE_FILES='/absolute/path/to/image-01.png:/absolute/path/to/image-02.png:/absolute/path/to/image-03.png:/absolute/path/to/image-04.png:/absolute/path/to/image-05.png:/absolute/path/to/image-06.png:/absolute/path/to/image-07.png:/absolute/path/to/image-08.png:/absolute/path/to/image-09.png:/absolute/path/to/image-10.png' \
+uv run pytest -q test/test_web_chat_live.py -s
+```
+
+文本流用例应在可用账号下完成。当前附件用例在检测到 `attachment_unavailable` 时预期为 `xfail`；缺少外部凭证、可用账号或真实夹具时会跳过。因此该命令不能作为 PDF/Office 附件已可用的证明。
 
 ### 号池管理功能
 
