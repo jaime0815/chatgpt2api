@@ -140,6 +140,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   const draftAttachmentsRef = useRef<PreviewAttachment[]>([])
   const imageAttachmentCacheRef = useRef(new Map<string, PreparedChatAttachment>())
   const imageMessageOwnersRef = useRef(new Map<string, string>())
+  const imageMessageAttachmentIdsRef = useRef(new Map<string, readonly string[]>())
   const discardedImageMessageIdsRef = useRef(new Set<string>())
   const imageSubmitInFlightRef = useRef(false)
 
@@ -204,9 +205,13 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
         return attachment ? [attachment] : []
       })
       await controller.upsertMessage(message, attachments, { conversationId })
+      if (discardedImageMessageIdsRef.current.has(message.id)) {
+        return
+      }
       for (const attachment of attachments) {
         imageAttachmentCacheRef.current.delete(attachment.id)
       }
+      imageMessageAttachmentIdsRef.current.delete(message.id)
     },
     [controller],
   )
@@ -245,18 +250,25 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       }
 
       const removedImageMessageIds = [...imageMessageIds]
+      const removedAttachmentIds = new Set([
+        ...imageMessages.flatMap((message) => message.attachmentIds),
+        ...removedImageMessageIds.flatMap(
+          (messageId) => imageMessageAttachmentIdsRef.current.get(messageId) || [],
+        ),
+      ])
       removedImageMessageIds.forEach((messageId) => discardedImageMessageIdsRef.current.add(messageId))
       discardImageMessages(removedImageMessageIds)
-      removedImageMessageIds.forEach((messageId) => imageMessageOwnersRef.current.delete(messageId))
+      removedImageMessageIds.forEach((messageId) => {
+        imageMessageOwnersRef.current.delete(messageId)
+        imageMessageAttachmentIdsRef.current.delete(messageId)
+      })
 
       if (clearAllCachedAttachments) {
         imageAttachmentCacheRef.current.clear()
+        imageMessageAttachmentIdsRef.current.clear()
         return
       }
 
-      const removedAttachmentIds = new Set(
-        imageMessages.flatMap((message) => message.attachmentIds),
-      )
       const retainedAttachmentIds = new Set([
         ...draftAttachmentsRef.current.map((attachment) => attachment.id),
         ...controller.state.conversations.flatMap((conversation) =>
@@ -272,6 +284,14 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       }
     },
     [controller.state.conversations, discardImageMessages],
+  )
+
+  const ownerMessageIdsForConversation = useCallback(
+    (conversationId: string, currentMessageIds: ReadonlySet<string> = new Set()) =>
+      [...imageMessageOwnersRef.current.entries()].flatMap(([messageId, ownerConversationId]) =>
+        ownerConversationId === conversationId && !currentMessageIds.has(messageId) ? [messageId] : [],
+      ),
+    [],
   )
 
   useEffect(() => {
@@ -343,6 +363,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
     for (const { conversationId, message } of recoveryMessageOwners) {
       if ((message.images || []).length > 0) {
         imageMessageOwnersRef.current.set(message.id, conversationId)
+        imageMessageAttachmentIdsRef.current.set(message.id, message.attachmentIds)
       }
     }
     if (recoveryKey.length === 0) {
@@ -383,6 +404,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       draftAttachmentsRef.current = []
       imageAttachmentCacheRef.current.clear()
       imageMessageOwnersRef.current.clear()
+      imageMessageAttachmentIdsRef.current.clear()
     },
     [],
   )
@@ -474,6 +496,10 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       }
       const messageId = createChatImageMessageId()
       imageMessageOwnersRef.current.set(messageId, conversationId)
+      imageMessageAttachmentIdsRef.current.set(
+        messageId,
+        references.map((attachment) => attachment.id),
+      )
       references.forEach((attachment) => imageAttachmentCacheRef.current.set(attachment.id, attachment))
       await submitImageTask({
         prompt,
@@ -518,10 +544,17 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
         throw new Error("没有找到要编辑的用户消息")
       }
       const messageIndex = conversation.messages.findIndex((item) => item.id === messageId)
-      discardTrackedImageMessages(conversation.messages.slice(messageIndex + 1))
+      const firstRemovedIndex = messageIndex + 1
+      discardTrackedImageMessages(
+        conversation.messages.slice(firstRemovedIndex),
+        ownerMessageIdsForConversation(
+          conversation.id,
+          new Set(conversation.messages.map((item) => item.id)),
+        ),
+      )
       await controller.editAndResend(messageId, { text: inputValue.text, attachmentIds: [] })
     },
-    [activeConversation?.messages, controller, discardTrackedImageMessages],
+    [activeConversation?.messages, controller, discardTrackedImageMessages, ownerMessageIdsForConversation],
   )
 
   const handleRetryAssistant = useCallback(
@@ -537,14 +570,20 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
         return
       }
       const messageIndex = conversation.messages.findIndex((item) => item.id === messageId)
-      discardTrackedImageMessages(conversation.messages.slice(messageIndex))
+      discardTrackedImageMessages(
+        conversation.messages.slice(messageIndex),
+        ownerMessageIdsForConversation(
+          conversation.id,
+          new Set(conversation.messages.map((item) => item.id)),
+        ),
+      )
       try {
         await controller.retryAssistant(messageId)
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "重新生成失败")
       }
     },
-    [activeConversation?.messages, controller, discardTrackedImageMessages],
+    [activeConversation?.messages, controller, discardTrackedImageMessages, ownerMessageIdsForConversation],
   )
 
   const handleUseImageAsReference = useCallback(
@@ -651,10 +690,13 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   const handleDeleteConversation = useCallback(
     (conversationId: string) => {
       const conversation = controller.state.conversations.find((item) => item.id === conversationId)
-      discardTrackedImageMessages(conversation?.messages || [])
+      discardTrackedImageMessages(
+        conversation?.messages || [],
+        ownerMessageIdsForConversation(conversationId),
+      )
       void controller.deleteConversation(conversationId)
     },
-    [controller, discardTrackedImageMessages],
+    [controller, discardTrackedImageMessages, ownerMessageIdsForConversation],
   )
 
   const handleClearHistory = useCallback(async () => {
@@ -664,6 +706,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       true,
     )
     imageMessageOwnersRef.current.clear()
+    imageMessageAttachmentIdsRef.current.clear()
     await controller.clearHistory()
   }, [controller, discardTrackedImageMessages])
 

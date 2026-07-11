@@ -335,6 +335,26 @@ function controllerWithBranch() {
   return { controller: next, user, assistant, image }
 }
 
+function controllerWithRetainedImageBeforeBranch() {
+  const branch = controllerWithBranch()
+  const retainedImage: ChatMessage = {
+    id: "image-before-anchor",
+    role: "assistant",
+    text: "keep this image",
+    attachmentIds: [],
+    status: "complete",
+    createdAt: "2026-07-11T07:59:00.000Z",
+    images: [{ id: "before-image", taskId: "before-task", status: "success" }],
+  }
+  const conversation: ChatConversation = {
+    ...branch.controller.activeConversation,
+    messages: [retainedImage, ...branch.controller.activeConversation.messages],
+  }
+  branch.controller.state.conversations = [conversation]
+  branch.controller.activeConversation = conversation
+  return { ...branch, retainedImage }
+}
+
 function imageTasks() {
   return {
     activeTaskIds: [],
@@ -355,6 +375,22 @@ function deferred<Value>() {
     reject = rejectPromise
   })
   return { promise, resolve, reject }
+}
+
+async function startPendingImageSubmission() {
+  act(() => {
+    ;(mocks.composerOptions as { onModeChange: (mode: "chat" | "image") => void }).onModeChange("image")
+  })
+  act(() => {
+    ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("draw city")
+  })
+  const submission = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+  await waitFor(() =>
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).submit).toHaveBeenCalledOnce(),
+  )
+  const messageId = (mocks.imageTasks as ReturnType<typeof imageTasks>).submit.mock.calls[0]?.[0]
+    ?.messageId as string
+  return { submission, messageId }
 }
 
 describe("ChatPage", () => {
@@ -832,6 +868,33 @@ describe("ChatPage", () => {
     expect(branch.controller.editAndResend).not.toHaveBeenCalled()
   })
 
+  it("keeps a retained image task before an edited branch", async () => {
+    const branch = controllerWithRetainedImageBeforeBranch()
+    mocks.controller = branch.controller
+    render(<ChatPage />)
+
+    await waitFor(() =>
+      expect((mocks.imageTasks as ReturnType<typeof imageTasks>).recoverImageMessages).toHaveBeenCalledWith(
+        branch.controller.activeConversation.messages,
+      ),
+    )
+    await act(async () => {
+      await (mocks.threadOptions as {
+        onEditAndResend: (
+          messageId: string,
+          input: { text: string; attachmentIds: string[]; files: File[] },
+        ) => Promise<void>
+      }).onEditAndResend("user-anchor", { text: "edited prompt", attachmentIds: [], files: [] })
+    })
+
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).toHaveBeenCalledWith([
+      branch.image.id,
+    ])
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).not.toHaveBeenCalledWith(
+      expect.arrayContaining([branch.retainedImage.id]),
+    )
+  })
+
   it("discards image tasks truncated by an assistant retry and absorbs retries while streaming", async () => {
     const branch = controllerWithBranch()
     mocks.controller = branch.controller
@@ -861,6 +924,172 @@ describe("ChatPage", () => {
     expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).not.toHaveBeenCalledWith([
       streamingBranch.image.id,
     ])
+  })
+
+  it("keeps a retained image task before a retried branch", async () => {
+    const branch = controllerWithRetainedImageBeforeBranch()
+    mocks.controller = branch.controller
+    render(<ChatPage />)
+
+    await waitFor(() =>
+      expect((mocks.imageTasks as ReturnType<typeof imageTasks>).recoverImageMessages).toHaveBeenCalledWith(
+        branch.controller.activeConversation.messages,
+      ),
+    )
+    await act(async () => {
+      await (mocks.threadOptions as { onRetry: (messageId: string) => void | Promise<void> }).onRetry(
+        "assistant-anchor",
+      )
+    })
+
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).toHaveBeenCalledWith([
+      branch.image.id,
+    ])
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).not.toHaveBeenCalledWith(
+      expect.arrayContaining([branch.retainedImage.id]),
+    )
+  })
+
+  it("cancels a pending owned image message when its conversation is deleted", async () => {
+    const pendingUpsert = deferred<unknown>()
+    const pendingController = controller()
+    pendingController.upsertMessage = vi.fn(() => pendingUpsert.promise)
+    mocks.controller = pendingController
+    const tasks = imageTasks()
+    let queuedMessage!: ChatMessage
+    tasks.submit = vi.fn(async (input) => {
+      queuedMessage = {
+        id: input.messageId,
+        role: "assistant",
+        text: input.prompt,
+        attachmentIds: [],
+        status: "queued",
+        createdAt: "2026-07-11T08:00:00.000Z",
+        images: [{ id: "pending-image", taskId: "pending-task", status: "queued" }],
+      }
+      await (mocks.imageOptions as { onMessageChange: (message: ChatMessage) => Promise<void> }).onMessageChange(
+        queuedMessage,
+      )
+    })
+    mocks.imageTasks = tasks
+    render(<ChatPage />)
+
+    const { submission, messageId } = await startPendingImageSubmission()
+    await waitFor(() => expect(pendingController.upsertMessage).toHaveBeenCalledWith(
+      queuedMessage,
+      [],
+      { conversationId: activeConversation.id },
+    ))
+
+    fireEvent.click(screen.getByRole("button", { name: "删除对话" }))
+    expect(tasks.discardImageMessages).toHaveBeenCalledWith(expect.arrayContaining([messageId]))
+
+    await act(async () => {
+      pendingUpsert.resolve({})
+      await submission
+    })
+    pendingController.upsertMessage.mockClear()
+    await act(async () => {
+      await (mocks.imageOptions as { onMessageChange: (message: ChatMessage) => Promise<void> }).onMessageChange(
+        queuedMessage,
+      )
+    })
+    expect(pendingController.upsertMessage).not.toHaveBeenCalled()
+  })
+
+  it("cancels a pending owned image message when editing truncates its branch", async () => {
+    const pendingUpsert = deferred<unknown>()
+    const branch = controllerWithBranch()
+    branch.controller.upsertMessage = vi.fn(() => pendingUpsert.promise)
+    mocks.controller = branch.controller
+    const tasks = imageTasks()
+    let queuedMessage!: ChatMessage
+    tasks.submit = vi.fn(async (input) => {
+      queuedMessage = {
+        id: input.messageId,
+        role: "assistant",
+        text: input.prompt,
+        attachmentIds: [],
+        status: "queued",
+        createdAt: "2026-07-11T08:00:00.000Z",
+        images: [{ id: "pending-image", taskId: "pending-task", status: "queued" }],
+      }
+      await (mocks.imageOptions as { onMessageChange: (message: ChatMessage) => Promise<void> }).onMessageChange(
+        queuedMessage,
+      )
+    })
+    mocks.imageTasks = tasks
+    render(<ChatPage />)
+
+    const { submission, messageId } = await startPendingImageSubmission()
+    await waitFor(() => expect(branch.controller.upsertMessage).toHaveBeenCalledOnce())
+    await act(async () => {
+      await (mocks.threadOptions as {
+        onEditAndResend: (
+          id: string,
+          input: { text: string; attachmentIds: string[]; files: File[] },
+        ) => Promise<void>
+      }).onEditAndResend("user-anchor", { text: "edited prompt", attachmentIds: [], files: [] })
+    })
+    expect(tasks.discardImageMessages).toHaveBeenCalledWith(expect.arrayContaining([messageId]))
+
+    await act(async () => {
+      pendingUpsert.resolve({})
+      await submission
+    })
+    branch.controller.upsertMessage.mockClear()
+    await act(async () => {
+      await (mocks.imageOptions as { onMessageChange: (message: ChatMessage) => Promise<void> }).onMessageChange(
+        queuedMessage,
+      )
+    })
+    expect(branch.controller.upsertMessage).not.toHaveBeenCalled()
+  })
+
+  it("cancels a pending owned image message when retrying truncates its branch", async () => {
+    const pendingUpsert = deferred<unknown>()
+    const branch = controllerWithBranch()
+    branch.controller.upsertMessage = vi.fn(() => pendingUpsert.promise)
+    mocks.controller = branch.controller
+    const tasks = imageTasks()
+    let queuedMessage!: ChatMessage
+    tasks.submit = vi.fn(async (input) => {
+      queuedMessage = {
+        id: input.messageId,
+        role: "assistant",
+        text: input.prompt,
+        attachmentIds: [],
+        status: "queued",
+        createdAt: "2026-07-11T08:00:00.000Z",
+        images: [{ id: "pending-image", taskId: "pending-task", status: "queued" }],
+      }
+      await (mocks.imageOptions as { onMessageChange: (message: ChatMessage) => Promise<void> }).onMessageChange(
+        queuedMessage,
+      )
+    })
+    mocks.imageTasks = tasks
+    render(<ChatPage />)
+
+    const { submission, messageId } = await startPendingImageSubmission()
+    await waitFor(() => expect(branch.controller.upsertMessage).toHaveBeenCalledOnce())
+    await act(async () => {
+      await (mocks.threadOptions as { onRetry: (id: string) => void | Promise<void> }).onRetry(
+        "assistant-anchor",
+      )
+    })
+    expect(tasks.discardImageMessages).toHaveBeenCalledWith(expect.arrayContaining([messageId]))
+
+    await act(async () => {
+      pendingUpsert.resolve({})
+      await submission
+    })
+    branch.controller.upsertMessage.mockClear()
+    await act(async () => {
+      await (mocks.imageOptions as { onMessageChange: (message: ChatMessage) => Promise<void> }).onMessageChange(
+        queuedMessage,
+      )
+    })
+    expect(branch.controller.upsertMessage).not.toHaveBeenCalled()
   })
 
   it("restores image dimensions from the shared ratio and tier when older preferences omit them", async () => {
