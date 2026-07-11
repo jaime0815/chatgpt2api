@@ -176,8 +176,21 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
     [recoveryMessages],
   )
   const modelResolution = useMemo(
-    () => resolveChatModelSelection(controller.state.selectedModel, chatModels),
-    [chatModels, controller.state.selectedModel],
+    () =>
+      modelsLoaded
+        ? resolveChatModelSelection(controller.state.selectedModel, chatModels)
+        : {
+            selected: String(controller.state.selectedModel || "auto").trim() || "auto",
+            unavailable: null,
+          },
+    [chatModels, controller.state.selectedModel, modelsLoaded],
+  )
+  const displayedChatModels = useMemo(
+    () =>
+      modelsLoaded || modelResolution.selected === "auto"
+        ? chatModels
+        : ["auto", modelResolution.selected],
+    [chatModels, modelResolution.selected, modelsLoaded],
   )
 
   const persistImageMessage = useCallback(
@@ -304,9 +317,8 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
         setModelsLoaded(true)
       },
       () => {
-        if (!cancelled) {
-          setChatModels(["auto"])
-          setImageModels(["gpt-image-2"])
+        if (cancelled) {
+          return
         }
       },
     )
@@ -436,6 +448,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
         setInput((current) => (current === submittedInput ? "" : current))
         await stream
       } catch (error) {
+        setInput((current) => current || submittedInput)
         toast.error(error instanceof Error ? error.message : "发送消息失败")
       }
       return
@@ -702,11 +715,11 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
         }
         header={
           <ChatHeader
-            models={chatModels}
-            selectedModel={controller.state.selectedModel}
-            unavailableModel={modelResolution.unavailable}
+            models={displayedChatModels}
+            selectedModel={modelsLoaded ? controller.state.selectedModel : modelResolution.selected}
+            unavailableModel={modelsLoaded ? modelResolution.unavailable : null}
             conversationTitle={activeConversation?.title}
-            modelDisabled={controller.state.isLoading}
+            modelDisabled={controller.state.isLoading || !modelsLoaded}
             onModelChange={(model) => {
               void controller.setSelectedModel(model)
             }}

@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   imageTasks: null as unknown,
   composerOptions: null as unknown,
   threadOptions: null as unknown,
+  headerOptions: null as unknown,
 }))
 
 vi.mock("next/navigation", () => ({
@@ -110,12 +111,32 @@ vi.mock("./components/chat-sidebar", () => ({
 }))
 
 vi.mock("./components/chat-header", () => ({
-  ChatHeader: ({ onModelChange, onNewConversation }: { onModelChange: (model: string) => void; onNewConversation: () => void }) => (
-    <header>
-      <button type="button" onClick={() => onModelChange("gpt-5.2")}>选择模型</button>
-      <button type="button" onClick={onNewConversation}>新对话</button>
-    </header>
-  ),
+  ChatHeader: ({
+    models,
+    selectedModel,
+    unavailableModel,
+    modelDisabled,
+    onModelChange,
+    onNewConversation,
+  }: {
+    models: string[]
+    selectedModel: string
+    unavailableModel?: string | null
+    modelDisabled?: boolean
+    onModelChange: (model: string) => void
+    onNewConversation: () => void
+  }) => {
+    mocks.headerOptions = { models, selectedModel, unavailableModel, modelDisabled }
+    return (
+      <header>
+        <output data-testid="header-selected-model">{selectedModel}</output>
+        <output data-testid="header-unavailable-model">{unavailableModel || ""}</output>
+        <output data-testid="header-model-disabled">{String(Boolean(modelDisabled))}</output>
+        <button type="button" onClick={() => onModelChange("gpt-5.2")}>选择模型</button>
+        <button type="button" onClick={onNewConversation}>新对话</button>
+      </header>
+    )
+  },
 }))
 
 vi.mock("./components/chat-thread", () => ({
@@ -364,6 +385,7 @@ describe("ChatPage", () => {
     mocks.controllerOptions = null
     mocks.composerOptions = null
     mocks.threadOptions = null
+    mocks.headerOptions = null
     document.documentElement.classList.remove("dark")
   })
 
@@ -560,6 +582,30 @@ describe("ChatPage", () => {
     expect(hydratedController.setSelectedModel).not.toHaveBeenCalled()
   })
 
+  it("keeps a hydrated model visible without an unavailable fallback when the catalog fails", async () => {
+    const hydratedController = controller()
+    hydratedController.state.selectedModel = "gpt-5.2"
+    mocks.controller = hydratedController
+    const catalog = deferred<{ data: Array<{ id: string }> }>()
+    mocks.fetchModels.mockReturnValue(catalog.promise)
+
+    render(<ChatPage />)
+    await waitFor(() => expect(mocks.fetchModels).toHaveBeenCalledOnce())
+    await act(async () => {
+      catalog.reject(new Error("catalog unavailable"))
+      await Promise.resolve()
+    })
+
+    expect(mocks.headerOptions).toMatchObject({
+      models: ["auto", "gpt-5.2"],
+      selectedModel: "gpt-5.2",
+      unavailableModel: null,
+      modelDisabled: true,
+    })
+    expect(screen.getByTestId("header-selected-model")).toHaveTextContent("gpt-5.2")
+    expect(screen.getByTestId("header-unavailable-model")).toBeEmptyDOMElement()
+  })
+
   it("submits one image task while an earlier submit is still pending and releases the guard after failure", async () => {
     const pendingSubmit = deferred<unknown>()
     const tasks = imageTasks()
@@ -682,6 +728,50 @@ describe("ChatPage", () => {
     })
 
     expect(screen.getByTestId("composer-value")).toHaveTextContent("P")
+  })
+
+  it("restores a text draft when its stream rejects before completion", async () => {
+    const pendingStream = deferred<void>()
+    const textController = controller()
+    textController.sendText = vi.fn(() => pendingStream.promise)
+    mocks.controller = textController
+    render(<ChatPage />)
+
+    act(() => {
+      ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("P")
+    })
+    const send = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    await waitFor(() => expect(textController.sendText).toHaveBeenCalledWith({ text: "P" }))
+    expect(screen.getByTestId("composer-value")).toBeEmptyDOMElement()
+
+    await act(async () => {
+      pendingStream.reject(new Error("stream rejected"))
+      await send
+    })
+    expect(screen.getByTestId("composer-value")).toHaveTextContent("P")
+  })
+
+  it("preserves a newer text draft when its stream rejects", async () => {
+    const pendingStream = deferred<void>()
+    const textController = controller()
+    textController.sendText = vi.fn(() => pendingStream.promise)
+    mocks.controller = textController
+    render(<ChatPage />)
+
+    act(() => {
+      ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("P")
+    })
+    const send = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    await waitFor(() => expect(textController.sendText).toHaveBeenCalledWith({ text: "P" }))
+    act(() => {
+      ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("Q")
+    })
+
+    await act(async () => {
+      pendingStream.reject(new Error("stream rejected"))
+      await send
+    })
+    expect(screen.getByTestId("composer-value")).toHaveTextContent("Q")
   })
 
   it("discards image tasks truncated by an edit before a delayed image update can revive them", async () => {
