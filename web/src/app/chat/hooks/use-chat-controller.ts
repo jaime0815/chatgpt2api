@@ -721,52 +721,65 @@ export function useChatController({ subjectId, authKey, dependencies }: UseChatC
     [activeRunConversation, attemptStorageWrite],
   )
 
+  const resolveAttachments = useCallback(
+    async (attachmentIds: readonly string[]) => {
+      if (!isSubjectReady()) {
+        return []
+      }
+      const referencedAttachmentIds = () =>
+        new Set(
+          stateRef.current.conversations.flatMap((conversation) =>
+            conversation.messages.flatMap((message) => message.attachmentIds),
+          ),
+        )
+      const requestedIds = uniqueStrings(attachmentIds).filter((id) => referencedAttachmentIds().has(id))
+      if (requestedIds.length === 0) {
+        return []
+      }
+      const session = subjectSessionRef.current
+      const isCurrentSession = () =>
+        subjectSessionRef.current === session &&
+        stateRef.current.subjectId === session.subjectId &&
+        !stateRef.current.isLoading
+      const missingIds = requestedIds.filter((id) => !attachmentCacheRef.current.has(id))
+      if (missingIds.length > 0) {
+        const stored = await dependenciesRef.current.getAttachments(session.subjectId, missingIds)
+        if (!isCurrentSession()) {
+          return []
+        }
+        for (const attachment of stored) {
+          if (requestedIds.includes(attachment.id) && referencedAttachmentIds().has(attachment.id)) {
+            attachmentCacheRef.current.set(attachment.id, attachment)
+          }
+        }
+      }
+      if (!isCurrentSession()) {
+        return []
+      }
+      return requestedIds.filter((id) => referencedAttachmentIds().has(id)).flatMap((id) => {
+        const attachment = attachmentCacheRef.current.get(id)
+        return attachment ? [attachment] : []
+      })
+    },
+    [isSubjectReady],
+  )
+
   const resolveReferencedAttachments = useCallback(
     async (run: ActiveRun, messages: readonly ChatMessage[]) => {
       if (!activeRunConversation(run)) {
         return null
       }
       const ids = uniqueStrings(messages.flatMap((message) => message.attachmentIds))
-      const missingIds: string[] = []
-      for (const id of ids) {
-        if (!activeRunConversation(run)) {
-          return null
-        }
-        if (!attachmentCacheRef.current.has(id)) {
-          missingIds.push(id)
-        }
-      }
-      if (missingIds.length > 0) {
-        if (!activeRunConversation(run)) {
-          return null
-        }
-        const stored = await dependenciesRef.current.getAttachments(run.subjectId, missingIds)
-        if (!activeRunConversation(run)) {
-          return null
-        }
-        for (const attachment of stored) {
-          if (!activeRunConversation(run)) {
-            return null
-          }
-          attachmentCacheRef.current.set(attachment.id, attachment)
-        }
-      }
-      const resolved: PreparedChatAttachment[] = []
-      for (const id of ids) {
-        if (!activeRunConversation(run)) {
-          return null
-        }
-        const attachment = attachmentCacheRef.current.get(id)
-        if (attachment) {
-          resolved.push(attachment)
-        }
+      const resolved = await resolveAttachments(ids)
+      if (!activeRunConversation(run)) {
+        return null
       }
       if (resolved.length !== ids.length) {
         throw new Error("无法读取当前对话引用的附件，请重新添加后再试")
       }
       return resolved
     },
-    [activeRunConversation],
+    [activeRunConversation, resolveAttachments],
   )
 
   const terminalTransition = useCallback(
@@ -929,11 +942,12 @@ export function useChatController({ subjectId, authKey, dependencies }: UseChatC
         terminal: null,
       }
       activeRunRef.current = run
-      transition({
+      const next = transition({
         type: "start-stream",
         conversation: streamingConversation,
         stream: run,
       })
+      pruneAttachmentCache(next.conversations)
 
       await saveNewAttachments(run, newAttachments)
       if (!activeRunConversation(run)) {
@@ -953,6 +967,7 @@ export function useChatController({ subjectId, authKey, dependencies }: UseChatC
       isSubjectReady,
       persistRunConversation,
       saveNewAttachments,
+      pruneAttachmentCache,
       subjectId,
       transition,
     ],
@@ -1000,6 +1015,7 @@ export function useChatController({ subjectId, authKey, dependencies }: UseChatC
         globalThis.clearTimeout(timer)
       }
       checkpointTimersRef.current.clear()
+      attachmentCacheRef.current.clear()
     }
   }, [subjectId, transition])
 
@@ -1421,6 +1437,7 @@ export function useChatController({ subjectId, authKey, dependencies }: UseChatC
     retryAssistant,
     editAndResend,
     clearHistory,
+    resolveAttachments,
     setSelectedModel,
     setScrollPosition,
     clearStorageWarning,

@@ -779,6 +779,43 @@ describe("useChatController", () => {
     expect(dependencies.releaseUnreferencedAttachments).toHaveBeenCalledWith(SUBJECT_ID)
   })
 
+  it("releases cached image references when an edit truncates their branch", async () => {
+    const imageReference = {
+      ...attachment("p", "branch-reference.png"),
+      mimeType: "image/png",
+      kind: "image" as const,
+    }
+    const existing = conversation("conversation-1", [
+      message("user-1", "user", "old prompt"),
+      message("assistant-1", "assistant", "first answer"),
+    ])
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({
+      conversations: [existing],
+      preferences: { activeConversationId: existing.id },
+      streamChatFn,
+    })
+    const { result } = await renderController(dependencies)
+    const imageMessage = imageTurn("branch-image", "draw city", [imageReference.id])
+
+    await act(async () => {
+      await result.current.upsertMessage(imageMessage, [imageReference], {
+        conversationId: existing.id,
+      })
+    })
+    expect(await result.current.resolveAttachments([imageReference.id])).toEqual([imageReference])
+
+    await act(async () => {
+      await result.current.editAndResend("user-1", { text: "edited prompt" })
+    })
+    vi.mocked(dependencies.getAttachments).mockClear()
+
+    await expect(result.current.resolveAttachments([imageReference.id])).resolves.toEqual([])
+    expect(dependencies.getAttachments).not.toHaveBeenCalled()
+  })
+
   it("uploads new Blobs before persistence and streams only deduplicated referenced attachments", async () => {
     const oldAttachment = attachment("a", "old.txt")
     const newAttachment = attachment("b", "new.txt")
@@ -1023,6 +1060,73 @@ describe("useChatController", () => {
       expect.objectContaining({ text: "still answered", status: "complete" }),
     ])
     expect(streamChatFn.mock.calls[0]?.[1]).toEqual([newAttachment])
+  })
+
+  it("keeps quota-failed image references available for a retry resolver", async () => {
+    const imageReference = {
+      ...attachment("q", "quota-reference.png"),
+      mimeType: "image/png",
+      kind: "image" as const,
+    }
+    const { dependencies } = createDependencies()
+    dependencies.saveAttachment = vi.fn(async () => {
+      throw new ChatStorageQuotaError(
+        new DOMException("Storage quota exceeded", "QuotaExceededError"),
+      )
+    })
+    const { result } = await renderController(dependencies)
+    const pendingImage = imageTurn("quota-image", "draw city", [imageReference.id])
+
+    await act(async () => {
+      await result.current.upsertMessage(pendingImage, [imageReference])
+    })
+
+    const resolved = await result.current.resolveAttachments([imageReference.id])
+    expect(resolved).toEqual([imageReference])
+    expect(dependencies.getAttachments).not.toHaveBeenCalled()
+  })
+
+  it("does not expose a delayed attachment read after the chat subject changes", async () => {
+    const imageReference = {
+      ...attachment("r", "subject-reference.png"),
+      mimeType: "image/png",
+      kind: "image" as const,
+    }
+    const aliceRead = deferred<PreparedChatAttachment[]>()
+    const existing = conversation("alice-conversation", [
+      message("alice-user", "user", "attached", "complete", [imageReference.id]),
+    ])
+    const { dependencies } = createDependencies({
+      conversations: [existing],
+      preferences: { activeConversationId: existing.id },
+    })
+    dependencies.listConversations = vi.fn(async (subjectId) =>
+      subjectId === SUBJECT_ID ? [existing] : [],
+    )
+    dependencies.getPreferences = vi.fn(async (subjectId) => ({
+      activeConversationId: subjectId === SUBJECT_ID ? existing.id : null,
+      selectedModel: "auto",
+      scrollPositions: {},
+    }))
+    dependencies.getAttachments = vi.fn(async (subjectId) =>
+      subjectId === SUBJECT_ID ? aliceRead.promise : [],
+    )
+    const hook = await renderSubjectController(dependencies)
+
+    let resolving!: Promise<PreparedChatAttachment[]>
+    act(() => {
+      resolving = hook.result.current.resolveAttachments([imageReference.id])
+    })
+    await waitFor(() =>
+      expect(dependencies.getAttachments).toHaveBeenCalledWith(SUBJECT_ID, [imageReference.id]),
+    )
+
+    hook.rerender({ subjectId: OTHER_SUBJECT_ID })
+    await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
+    await act(async () => {
+      aliceRead.resolve([imageReference])
+      await expect(resolving).resolves.toEqual([])
+    })
   })
 
   it("isolates the rendered state and blocks writes during a synchronous subject switch", async () => {

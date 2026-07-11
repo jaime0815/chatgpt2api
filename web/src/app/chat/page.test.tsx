@@ -279,6 +279,7 @@ function controller() {
     retryAssistant: vi.fn(),
     editAndResend: vi.fn(),
     clearHistory: vi.fn(),
+    resolveAttachments: vi.fn(),
     setSelectedModel: vi.fn(),
     setScrollPosition: vi.fn(),
     clearStorageWarning: vi.fn(),
@@ -898,7 +899,9 @@ describe("ChatPage", () => {
       resolveAttachments: (attachmentIds: readonly string[]) => Promise<unknown>
     }
     await imageOptions.resolveAttachments([reference.id])
-    expect(mocks.getChatAttachments).toHaveBeenCalledWith("subject-user", [reference.id])
+    expect((mocks.controller as ReturnType<typeof controller>).resolveAttachments).toHaveBeenCalledWith([
+      reference.id,
+    ])
 
     fireEvent.click(screen.getByRole("button", { name: "添加附件" }))
     await waitFor(() =>

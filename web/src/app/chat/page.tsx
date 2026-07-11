@@ -212,8 +212,8 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   )
 
   const resolveImageAttachments = useCallback(
-    (attachmentIds: readonly string[]) => getChatAttachments(session.subjectId, attachmentIds),
-    [session.subjectId],
+    (attachmentIds: readonly string[]) => controller.resolveAttachments(attachmentIds),
+    [controller],
   )
 
   const {
