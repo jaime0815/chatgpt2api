@@ -124,7 +124,7 @@ export function ChatSidebar({
   return (
     <div className="flex h-full min-h-0 w-full flex-col bg-sidebar text-sidebar-foreground">
       <div className="flex h-14 shrink-0 items-center px-3">
-        <span className="truncate text-base font-semibold">ChatGPT2API</span>
+        <span className="truncate text-base font-semibold">ChatCanvas</span>
       </div>
 
       <div className="relative flex shrink-0 flex-col gap-1 px-2">

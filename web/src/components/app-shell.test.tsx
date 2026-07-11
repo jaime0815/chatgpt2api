@@ -122,6 +122,7 @@ describe("AppShell", () => {
 
     const chatLinks = await screen.findAllByRole("link", { name: "聊天" });
     const imageLinks = screen.getAllByRole("link", { name: "画图" });
+    expect(screen.getAllByText("ChatCanvas").length).toBeGreaterThan(0);
     expect(chatLinks.some((link) => link.getAttribute("href") === "/chat")).toBe(true);
     expect(imageLinks.some((link) => link.getAttribute("href") === "/image")).toBe(true);
   });

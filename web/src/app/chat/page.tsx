@@ -457,10 +457,12 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
           prepared.forEach((attachment) => imageAttachmentCacheRef.current.set(attachment.id, attachment))
         }
         setAttachmentError(null)
+        return true
       } catch (error) {
         const message = error instanceof Error ? error.message : "添加附件失败"
         setAttachmentError(message)
         toast.error(message)
+        return false
       }
     },
     [mode, updateDraftAttachments],
@@ -652,8 +654,9 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       }
       try {
         const file = await chatImageUrlToFile(image.url, `reference-${image.id}.png`)
-        await addFiles([file], "image")
-        setMode("image")
+        if (await addFiles([file], "image")) {
+          setMode("image")
+        }
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "读取参考图失败")
       }
@@ -889,7 +892,9 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
               onValueChange={setInput}
               onSubmit={() => handleSubmit()}
               onStop={controller.stop}
-              onFilesSelected={addFiles}
+              onFilesSelected={(files) => {
+                void addFiles(files)
+              }}
               onRemoveAttachment={removeDraftAttachment}
               onModeChange={setMode}
               onImageSettingsChange={handleImageSettingsChange}

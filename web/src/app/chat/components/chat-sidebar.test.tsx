@@ -53,7 +53,7 @@ describe("ChatSidebar", () => {
   it("groups history and reports desktop navigation actions", () => {
     const callbacks = renderSidebar()
 
-    expect(screen.getByText("ChatGPT2API")).toBeInTheDocument()
+    expect(screen.getByText("ChatCanvas")).toBeInTheDocument()
     expect(screen.getByText("今天")).toBeInTheDocument()
     expect(screen.getByText("过去 7 天")).toBeInTheDocument()
     expect(screen.getByText("更早")).toBeInTheDocument()

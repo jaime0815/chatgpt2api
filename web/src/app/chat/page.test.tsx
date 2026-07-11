@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   getChatAttachments: vi.fn(),
   chatImageUrlToFile: vi.fn(),
   prepareChatAttachments: vi.fn(),
+  validateChatAttachments: vi.fn(),
   authGuard: {
     isCheckingAuth: false,
     session: null as {
@@ -55,7 +56,7 @@ vi.mock("@/app/chat/lib/chat-images", () => ({
 
 vi.mock("@/app/chat/lib/chat-attachments", () => ({
   prepareChatAttachments: mocks.prepareChatAttachments,
-  validateChatAttachments: (attachments: unknown[]) => attachments,
+  validateChatAttachments: mocks.validateChatAttachments,
 }))
 
 vi.mock("./hooks/use-chat-controller", () => ({
@@ -429,6 +430,8 @@ describe("ChatPage", () => {
     mocks.chatImageUrlToFile.mockReset()
     mocks.prepareChatAttachments.mockReset()
     mocks.prepareChatAttachments.mockResolvedValue([])
+    mocks.validateChatAttachments.mockReset()
+    mocks.validateChatAttachments.mockImplementation((attachments: unknown[]) => attachments)
     mocks.authGuard = {
       isCheckingAuth: false,
       session: {
@@ -835,9 +838,12 @@ describe("ChatPage", () => {
     act(() => {
       ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("P")
     })
-    const send = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    let send!: Promise<void>
+    act(() => {
+      send = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    })
     await waitFor(() => expect(textController.sendText).toHaveBeenCalledWith({ text: "P" }))
-    expect(screen.getByTestId("composer-value")).toBeEmptyDOMElement()
+    await waitFor(() => expect(screen.getByTestId("composer-value")).toBeEmptyDOMElement())
 
     await act(async () => {
       pendingStream.reject(new Error("stream rejected"))
@@ -1262,6 +1268,53 @@ describe("ChatPage", () => {
       { mode: "image" },
     )
     expect(screen.getByTestId("composer-mode")).toHaveTextContent("image")
+  })
+
+  it("keeps chat mode when a document draft prevents adding an image reference", async () => {
+    const documentAttachment = {
+      id: "draft-document",
+      name: "summary.pdf",
+      mimeType: "application/pdf",
+      size: 5,
+      sha256: "d".repeat(64),
+      kind: "document" as const,
+      blob: new Blob(["pdf"], { type: "application/pdf" }),
+    }
+    const imageReference = {
+      id: "reference-image",
+      name: "reference.png",
+      mimeType: "image/png",
+      size: 5,
+      sha256: "r".repeat(64),
+      kind: "image" as const,
+      blob: new Blob(["image"], { type: "image/png" }),
+    }
+    mocks.prepareChatAttachments
+      .mockResolvedValueOnce([documentAttachment])
+      .mockResolvedValueOnce([imageReference])
+    mocks.chatImageUrlToFile.mockResolvedValue(
+      new File(["image"], "reference-image.png", { type: "image/png" }),
+    )
+    mocks.validateChatAttachments.mockImplementation((attachments: Array<{ kind: string }>, options) => {
+      if (options?.mode === "image" && attachments.some((attachment) => attachment.kind === "document")) {
+        throw new Error("生成图片模式不能添加文档附件")
+      }
+      return attachments
+    })
+
+    render(<ChatPage />)
+
+    await act(async () => {
+      await (mocks.composerOptions as {
+        onFilesSelected: (files: File[]) => Promise<void>
+      }).onFilesSelected([new File(["pdf"], "summary.pdf", { type: "application/pdf" })])
+    })
+    fireEvent.click(screen.getByRole("button", { name: "用作参考图" }))
+
+    await waitFor(() =>
+      expect(screen.getByTestId("attachment-error")).toHaveTextContent("生成图片模式不能添加文档附件"),
+    )
+    expect(screen.getByTestId("composer-mode")).toHaveTextContent("chat")
   })
 
   it("releases temporary image references after removal and after their first persistence", async () => {
