@@ -116,6 +116,16 @@ CHAT_ATTACHMENT_PROCESSING_SUCCESS_STATES = {
     "success",
     "succeeded",
 }
+CHAT_ATTACHMENT_RESPONSE_SUCCESS_STATES = {
+    "complete",
+    "completed",
+    "finished",
+    "finished_successfully",
+    "ok",
+    "success",
+    "succeeded",
+    "uploaded",
+}
 
 # 内容政策违规错误关键词（上游拒绝生成图片的各种表述）
 _CONTENT_POLICY_KEYWORDS = (
@@ -1200,8 +1210,14 @@ class OpenAIBackendAPI:
 
     @staticmethod
     def _chat_attachment_semantics_ok(payload: Dict[str, Any], context: str) -> None:
-        status = str(payload.get("status") or "").strip().lower()
-        if payload.get("success") is False or status in CHAT_ATTACHMENT_FAILURE_STATES:
+        status_value = payload.get("status")
+        status = str(status_value).strip().lower() if status_value is not None else ""
+        status_is_present = status_value is not None and status != ""
+        success_is_present = "success" in payload
+        if (
+            (status_is_present and status not in CHAT_ATTACHMENT_RESPONSE_SUCCESS_STATES)
+            or (success_is_present and payload.get("success") is not True)
+        ):
             raise UpstreamHTTPError(
                 context,
                 502,

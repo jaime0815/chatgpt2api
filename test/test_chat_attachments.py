@@ -375,7 +375,18 @@ def test_document_processing_rejects_nested_failure_after_success(
     assert "signed-secret" not in str(captured.value)
 
 
-@pytest.mark.parametrize("payload", [{"status": "failed"}, {"success": False}])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "failed"},
+        {"status": "pending"},
+        {"status": "in_progress"},
+        {"status": "unknown"},
+        {"status": False},
+        {"success": False},
+        {"success": "false"},
+    ],
+)
 def test_unsuccessful_creation_response_does_not_upload_or_return_pointer(
     monkeypatch: pytest.MonkeyPatch,
     payload: dict[str, Any],
@@ -406,7 +417,18 @@ def test_unsuccessful_creation_response_does_not_upload_or_return_pointer(
     assert "signed-secret" not in str(captured.value)
 
 
-@pytest.mark.parametrize("payload", [{"status": "failed"}, {"success": False}])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "failed"},
+        {"status": "pending"},
+        {"status": "in_progress"},
+        {"status": "unknown"},
+        {"status": False},
+        {"success": False},
+        {"success": "false"},
+    ],
+)
 def test_unsuccessful_confirmation_response_does_not_return_pointer(
     signed_upload: _SignedUploadTransport,
     payload: dict[str, Any],
