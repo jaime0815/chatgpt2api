@@ -1354,12 +1354,16 @@ class OpenAIBackendAPI:
                 stream=True,
             ),
         )
+        registered = False
         try:
             self._chat_attachment_response_ok(
                 response,
                 context="chat attachment processing",
                 authenticated_request=True,
             )
+            registered = self._register_active_response(response)
+            if not registered:
+                raise RuntimeError("chat attachment processing cancelled")
             completed = False
             done = False
             failed = False
@@ -1393,7 +1397,8 @@ class OpenAIBackendAPI:
                 )
             return enrichment
         finally:
-            self._close_stream_response(response)
+            if not registered or self._release_active_response(response):
+                self._close_stream_response(response)
 
     def upload_chat_attachment_bytes(
         self,

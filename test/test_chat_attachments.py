@@ -47,6 +47,26 @@ class _JsonFailureResponse(_FakeResponse):
         raise RuntimeError("response contains file-secret?sig=signed-secret")
 
 
+class _BlockingProcessingResponse(_FakeResponse):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.released = threading.Event()
+        self.closed = False
+
+    def iter_lines(self):
+        self.started.set()
+        self.released.wait(timeout=5)
+        if self.closed:
+            return
+        yield b'data: {"event":"file.processing.completed","status":"success"}'
+        yield b"data: [DONE]"
+
+    def close(self) -> None:
+        self.closed = True
+        self.released.set()
+
+
 class _FakeSession:
     def __init__(self, responses: list[_FakeResponse]) -> None:
         self.headers = {"Authorization": "Bearer test-token"}
@@ -377,6 +397,38 @@ def test_chat_session_cancel_closes_blocking_attachment_upload(
             chat_session.close()
 
     assert signed_upload.sessions[0].close_calls == 1
+
+
+def test_cancel_active_response_closes_blocking_document_processing_stream(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    processing_response = _BlockingProcessingResponse()
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        processing_response,
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            backend.upload_chat_attachment_bytes,
+            b"%PDF-1.7",
+            "sample.pdf",
+            "application/pdf",
+            "document",
+        )
+        try:
+            assert processing_response.started.wait(timeout=1)
+            assert backend.cancel_active_response()
+            assert processing_response.closed
+            with pytest.raises(UpstreamHTTPError):
+                pending.result(timeout=1)
+        finally:
+            processing_response.released.set()
 
 
 def test_image_upload_returns_asset_pointer_without_document_processing(
