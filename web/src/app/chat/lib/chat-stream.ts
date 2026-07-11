@@ -273,6 +273,7 @@ export async function* streamChat(
   request: ChatStreamRequest,
   attachments: readonly PreparedChatAttachment[],
   signal?: AbortSignal,
+  workspaceAuthKey?: string,
 ): AsyncGenerator<ChatStreamEvent> {
   const orderedAttachments = orderedRequestAttachments(request, attachments)
   if (uniqueAttachmentBytes(orderedAttachments) > MAX_CHAT_WORKING_SET_BYTES) {
@@ -284,7 +285,7 @@ export async function* streamChat(
     formData.append("files", attachment.blob, attachment.name)
   }
 
-  const authKey = await getStoredAuthKey()
+  const authKey = String(workspaceAuthKey || "").trim() || await getStoredAuthKey()
   const headers: Record<string, string> = {}
   if (authKey) {
     headers.Authorization = `Bearer ${authKey}`

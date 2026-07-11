@@ -65,6 +65,33 @@ function message(
   } as const
 }
 
+function imageTurn(
+  id: string,
+  text: string,
+  attachmentIds: string[] = [],
+): ChatMessage {
+  return {
+    id,
+    role: "assistant",
+    text,
+    attachmentIds,
+    status: "complete",
+    createdAt: "2026-07-11T07:30:00.000Z",
+    imageSettings: {
+      mode: attachmentIds.length > 0 ? "edit" : "generate",
+      model: "gpt-image-2",
+      quality: "high",
+      width: "1024",
+      height: "1024",
+      ratio: "1:1",
+      tier: "1k",
+      count: 1,
+      referenceAttachmentIds: attachmentIds,
+    },
+    images: [{ id: `${id}-image`, taskId: `${id}-task`, status: "success", url: "/images/result.png" }],
+  }
+}
+
 function conversation(
   id: string,
   messages: ChatConversation["messages"] = [],
@@ -253,6 +280,32 @@ async function renderSubjectController(dependencies: ChatControllerDependencies)
 }
 
 describe("useChatController", () => {
+  it("binds stream requests to the authenticated workspace key", async () => {
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({ streamChatFn })
+    const hook = renderHook(() =>
+      useChatController({
+        subjectId: SUBJECT_ID,
+        authKey: "workspace-a-key",
+        dependencies,
+      }),
+    )
+    await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
+
+    await act(async () => {
+      await hook.result.current.sendText({ text: "send with workspace key" })
+    })
+
+    expect(streamChatFn).toHaveBeenCalledWith(
+      expect.any(Object),
+      [],
+      expect.any(AbortSignal),
+      "workspace-a-key",
+    )
+  })
+
   it("adds optimistic messages, accumulates deltas, generates a title, and sends thinking_effort", async () => {
     const events = createEventStream()
     const { dependencies } = createDependencies({ streamChatFn: events.streamChatFn })
@@ -375,6 +428,97 @@ describe("useChatController", () => {
     expect(streamChatFn.mock.calls[0]?.[0].messages).toEqual([
       expect.objectContaining({ id: "user-1", role: "user", text: "original prompt" }),
     ])
+  })
+
+  it("keeps a generated image in the timeline but omits it from a later text request", async () => {
+    const generated = imageTurn("generated-turn", "draw a neon city")
+    const existing = conversation("conversation-1", [
+      message("user-1", "user", "before image"),
+      generated,
+    ])
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({
+      conversations: [existing],
+      preferences: { activeConversationId: existing.id },
+      streamChatFn,
+    })
+    const { result } = await renderController(dependencies)
+
+    await act(async () => {
+      await result.current.sendText({ text: "now summarize the approach" })
+    })
+
+    expect(result.current.activeConversation?.messages).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: generated.id, text: generated.text })]),
+    )
+    expect(streamChatFn.mock.calls[0]?.[0].messages).toEqual([
+      expect.objectContaining({ id: "user-1", text: "before image" }),
+      expect.objectContaining({ text: "now summarize the approach" }),
+    ])
+  })
+
+  it("omits referenced image edits and their files from a later text request", async () => {
+    const reference = attachment("r", "reference.png", "reference")
+    const editedImage = imageTurn("edited-turn", "make it brighter", [reference.id])
+    const existing = conversation("conversation-1", [
+      message("user-1", "user", "before edit"),
+      editedImage,
+    ])
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({
+      conversations: [existing],
+      preferences: { activeConversationId: existing.id },
+      attachments: [reference],
+      streamChatFn,
+    })
+    const { result } = await renderController(dependencies)
+
+    await act(async () => {
+      await result.current.sendText({ text: "continue as plain text" })
+    })
+
+    const [request, attachments] = streamChatFn.mock.calls[0]!
+    expect(request.messages).toEqual([
+      expect.objectContaining({ id: "user-1", attachment_ids: [] }),
+      expect.objectContaining({ text: "continue as plain text", attachment_ids: [] }),
+    ])
+    expect(request.attachments).toEqual([])
+    expect(attachments).toEqual([])
+    expect(dependencies.getAttachments).not.toHaveBeenCalled()
+  })
+
+  it("uses the same filtered history when retrying text after an image turn", async () => {
+    const reference = attachment("s", "reference.png", "reference")
+    const existing = conversation("conversation-1", [
+      message("user-1", "user", "before image"),
+      imageTurn("edited-turn", "edit the reference", [reference.id]),
+      message("user-2", "user", "text question"),
+      message("assistant-2", "assistant", "failed answer", "error"),
+    ])
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({
+      conversations: [existing],
+      preferences: { activeConversationId: existing.id },
+      attachments: [reference],
+      streamChatFn,
+    })
+    const { result } = await renderController(dependencies)
+
+    await act(async () => {
+      await result.current.retryAssistant("assistant-2")
+    })
+
+    const [request, attachments] = streamChatFn.mock.calls[0]!
+    expect(request.messages.map((item) => item.id)).toEqual(["user-1", "user-2"])
+    expect(request.attachments).toEqual([])
+    expect(attachments).toEqual([])
+    expect(dependencies.getAttachments).not.toHaveBeenCalled()
   })
 
   it("upserts image-task messages into the active conversation and persists their references", async () => {
@@ -547,6 +691,50 @@ describe("useChatController", () => {
     })
 
     expect(result.current.state.conversations).toEqual([])
+  })
+
+  it("drops cached attachments when deleting or clearing their last conversation reference", async () => {
+    const cachedAttachment = attachment("z", "cached.txt")
+    const { dependencies } = createDependencies({ attachments: [cachedAttachment] })
+    const getAttachments = vi.mocked(dependencies.getAttachments)
+    const { result } = await renderController(dependencies)
+    const sourceMessage: ChatMessage = {
+      id: "cache-source",
+      role: "assistant",
+      text: "stored reference",
+      attachmentIds: [cachedAttachment.id],
+      status: "complete",
+      createdAt: "2026-07-11T08:00:00.000Z",
+    }
+
+    await act(async () => {
+      await result.current.upsertMessage(sourceMessage, [cachedAttachment])
+    })
+    const sourceConversationId = result.current.activeConversation?.id
+    expect(sourceConversationId).toBeTruthy()
+
+    await act(async () => {
+      await result.current.deleteConversation(sourceConversationId!)
+    })
+    getAttachments.mockClear()
+
+    await act(async () => {
+      await result.current.sendText({
+        text: "needs the persisted attachment again",
+        attachmentIds: [cachedAttachment.id],
+      })
+    })
+    expect(getAttachments).toHaveBeenCalledWith(SUBJECT_ID, [cachedAttachment.id])
+
+    getAttachments.mockClear()
+    await act(async () => {
+      await result.current.clearHistory()
+      await result.current.sendText({
+        text: "does not retain cleared attachment blobs",
+        attachmentIds: [cachedAttachment.id],
+      })
+    })
+    expect(getAttachments).toHaveBeenCalledWith(SUBJECT_ID, [cachedAttachment.id])
   })
 
   it("edits a user message, preserves omitted attachment references, and truncates its branch", async () => {

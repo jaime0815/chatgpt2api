@@ -166,6 +166,96 @@ describe("useChatImageTasks", () => {
     )
   })
 
+  it("does not recover a locally queued task before its create request has finished", async () => {
+    const queuedPersistence = deferred<void>()
+    const createdTask = deferred<ImageTask>()
+    let persistQueuedMessage = true
+    const createImageGenerationTask = vi.fn<ChatImageTaskDependencies["createImageGenerationTask"]>(
+      async () => createdTask.promise,
+    )
+    const dependencies = createDependencies({
+      createImageGenerationTask,
+      fetchImageTasks: vi.fn(async (ids: string[]) => ({
+        items: ids.map((id) => task(id, "success")),
+        missing_ids: [],
+      })),
+    })
+    const onMessageChange = vi.fn(async (message: ChatMessage) => {
+      if (persistQueuedMessage && message.status === "queued") {
+        await queuedPersistence.promise
+        persistQueuedMessage = false
+      }
+    })
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    let submission!: Promise<ChatMessage>
+    act(() => {
+      submission = result.current.submit({
+        prompt: "draw after recovery",
+        settings: { ...SETTINGS, count: "1" },
+      })
+    })
+    await waitFor(() => expect(onMessageChange).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "queued" }),
+    ))
+    const queued = onMessageChange.mock.calls[0]?.[0] as ChatMessage
+
+    await act(async () => {
+      await result.current.recoverImageMessages([queued])
+    })
+
+    expect(dependencies.fetchImageTasks).not.toHaveBeenCalled()
+
+    await act(async () => {
+      queuedPersistence.resolve()
+      await submission
+    })
+    await waitFor(() => expect(createImageGenerationTask).toHaveBeenCalledOnce())
+    const taskId = createImageGenerationTask.mock.calls[0]?.[0] as string
+    await act(async () => {
+      createdTask.resolve(task(taskId, "running"))
+    })
+
+    await waitFor(() => expect(onMessageChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        status: "complete",
+        images: [expect.objectContaining({ status: "success" })],
+      }),
+    ))
+  })
+
+  it("keeps a genuinely missing hydrated task terminal", async () => {
+    const dependencies = createDependencies({
+      fetchImageTasks: vi.fn(async (ids: string[]) => ({ items: [], missing_ids: ids })),
+    })
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const missing: ChatMessage = {
+      id: "assistant-missing",
+      role: "assistant",
+      text: "",
+      attachmentIds: [],
+      status: "running",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      images: [{ id: "image-missing", taskId: "missing-task", status: "running" }],
+    }
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    await act(async () => {
+      await result.current.recoverImageMessages([missing])
+    })
+
+    await waitFor(() => expect(onMessageChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        status: "error",
+        images: [expect.objectContaining({ status: "error", error: "图片任务不存在或已过期" })],
+      }),
+    ))
+  })
+
   it("discards deleted image messages before a pending poll can emit another update", async () => {
     const nextTasks = deferred<{ items: ImageTask[]; missing_ids: string[] }>()
     const dependencies = createDependencies({

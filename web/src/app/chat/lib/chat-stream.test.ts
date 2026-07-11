@@ -199,6 +199,25 @@ describe("streamChat", () => {
     ])
   })
 
+  it("uses the workspace-bound auth key instead of reading the shared session", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(byteStream("data: [DONE]\n\n"), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    await expect(collect(streamChat(request(), [], undefined, "workspace-a-key"))).resolves.toEqual([
+      { type: "complete" },
+    ])
+
+    expect(mocks.getStoredAuthKey).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual({
+      Authorization: "Bearer workspace-a-key",
+    })
+  })
+
   it("aborts an active response stream through the provided AbortSignal", async () => {
     const abortController = new AbortController()
     const fetchMock = vi.fn().mockImplementation((_url: string, init: RequestInit) => {

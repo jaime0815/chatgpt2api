@@ -450,6 +450,14 @@ function requestMessage(message: ChatMessage): ChatRequestMessage {
   }
 }
 
+function isImageTurn(message: ChatMessage) {
+  return Boolean(message.imageSettings || message.images?.length)
+}
+
+function textRequestHistory(messages: readonly ChatMessage[]) {
+  return messages.filter((message) => !isImageTurn(message))
+}
+
 function attachmentManifest(attachment: PreparedChatAttachment): ChatAttachmentManifest {
   return {
     id: attachment.id,
@@ -500,10 +508,11 @@ function preferencesFromState(state: ChatControllerState): ChatPreferences {
 
 export type UseChatControllerOptions = {
   subjectId: string
+  authKey?: string
   dependencies?: Partial<ChatControllerDependencies>
 }
 
-export function useChatController({ subjectId, dependencies }: UseChatControllerOptions) {
+export function useChatController({ subjectId, authKey, dependencies }: UseChatControllerOptions) {
   const dependenciesRef = useRef<ChatControllerDependencies>({
     ...DEFAULT_DEPENDENCIES,
     ...dependencies,
@@ -525,6 +534,19 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     stateRef.current = next
     reactDispatch(action)
     return next
+  }, [])
+
+  const pruneAttachmentCache = useCallback((conversations: readonly ChatConversation[]) => {
+    const referencedIds = new Set(
+      conversations.flatMap((conversation) =>
+        conversation.messages.flatMap((message) => message.attachmentIds),
+      ),
+    )
+    for (const attachmentId of attachmentCacheRef.current.keys()) {
+      if (!referencedIds.has(attachmentId)) {
+        attachmentCacheRef.current.delete(attachmentId)
+      }
+    }
   }, [])
 
   useEffect(() => {
@@ -778,7 +800,8 @@ export function useChatController({ subjectId, dependencies }: UseChatController
         if (!activeRunConversation(run)) {
           return
         }
-        const attachments = await resolveReferencedAttachments(run, history)
+        const requestHistory = textRequestHistory(history)
+        const attachments = await resolveReferencedAttachments(run, requestHistory)
         if (!attachments || !activeRunConversation(run)) {
           return
         }
@@ -788,7 +811,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
         }
         const request: ChatStreamRequest = {
           model: conversation.model || stateRef.current.selectedModel,
-          messages: history.map(requestMessage),
+          messages: requestHistory.map(requestMessage),
           attachments: attachments.map(attachmentManifest),
           thinking_effort: conversation.reasoningEffort,
         }
@@ -798,6 +821,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
           request,
           attachments,
           run.abortController.signal,
+          authKey,
         )) {
           if (!activeRunConversation(run)) {
             break
@@ -863,6 +887,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       scheduleCheckpoint,
       terminalTransition,
       transition,
+      authKey,
     ],
   )
 
@@ -1041,12 +1066,21 @@ export function useChatController({ subjectId, dependencies }: UseChatController
         clearCheckpoint(id)
       }
       const next = transition({ type: "delete-conversation", id })
+      pruneAttachmentCache(next.conversations)
       await attemptStorageWrite(() =>
         dependenciesRef.current.deleteConversation(subjectId, id),
       )
       await persistPreferences(next)
     },
-    [attemptStorageWrite, clearCheckpoint, isSubjectReady, persistPreferences, subjectId, transition],
+    [
+      attemptStorageWrite,
+      clearCheckpoint,
+      isSubjectReady,
+      persistPreferences,
+      pruneAttachmentCache,
+      subjectId,
+      transition,
+    ],
   )
 
   const sendText = useCallback(
@@ -1147,6 +1181,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
           ? stateRef.current.conversations.find((conversation) => conversation.id === targetConversationId)
           : null
         if (targetConversationId && !targetConversation) {
+          pruneAttachmentCache(stateRef.current.conversations)
           return null
         }
         const now = dependenciesRef.current.now()
@@ -1179,6 +1214,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
           conversation: nextConversation,
           activate,
         })
+        pruneAttachmentCache(next.conversations)
         await persistConversation(nextConversation)
         if (activate) {
           await persistPreferences(next)
@@ -1192,7 +1228,15 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       messageUpsertQueuesRef.current.set(upsertSession, settled)
       return operation
     },
-    [attemptStorageWrite, isSubjectReady, persistConversation, persistPreferences, subjectId, transition],
+    [
+      attemptStorageWrite,
+      isSubjectReady,
+      persistConversation,
+      persistPreferences,
+      pruneAttachmentCache,
+      subjectId,
+      transition,
+    ],
   )
 
   const stop = useCallback(() => {

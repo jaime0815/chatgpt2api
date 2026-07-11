@@ -300,6 +300,11 @@ type ImageTaskListResponse = {
   missing_ids: string[];
 };
 
+function workspaceAuthorization(authKey?: string) {
+  const normalizedAuthKey = String(authKey || "").trim();
+  return normalizedAuthKey ? { headers: { Authorization: `Bearer ${normalizedAuthKey}` } } : {};
+}
+
 export type LoginResponse = {
   ok: boolean;
   version: string;
@@ -455,7 +460,14 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
   );
 }
 
-export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
+export async function createImageGenerationTask(
+  clientTaskId: string,
+  prompt: string,
+  model?: ImageModel,
+  size?: string,
+  quality = "auto",
+  workspaceAuthKey?: string,
+) {
   return httpRequest<ImageTask>("/api/image-tasks/generations", {
     method: "POST",
     body: {
@@ -465,6 +477,7 @@ export async function createImageGenerationTask(clientTaskId: string, prompt: st
       ...(size ? { size } : {}),
       quality,
     },
+    ...workspaceAuthorization(workspaceAuthKey),
   });
 }
 
@@ -475,6 +488,7 @@ export async function createImageEditTask(
   model?: ImageModel,
   size?: string,
   quality = "auto",
+  workspaceAuthKey?: string,
 ) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
@@ -495,22 +509,24 @@ export async function createImageEditTask(
   return httpRequest<ImageTask>("/api/image-tasks/edits", {
     method: "POST",
     body: formData,
+    ...workspaceAuthorization(workspaceAuthKey),
   });
 }
 
-export async function fetchImageTasks(ids: string[]) {
+export async function fetchImageTasks(ids: string[], workspaceAuthKey?: string) {
   const params = new URLSearchParams();
   if (ids.length > 0) {
     params.set("ids", ids.join(","));
   }
   params.set("_t", String(Date.now()));
-  return httpRequest<ImageTaskListResponse>(`/api/image-tasks?${params.toString()}`);
+  return httpRequest<ImageTaskListResponse>(`/api/image-tasks?${params.toString()}`, workspaceAuthorization(workspaceAuthKey));
 }
 
-export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
+export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30, workspaceAuthKey?: string) {
   return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/resume-poll`, {
     method: "POST",
     body: { extra_timeout_secs: extraTimeoutSecs },
+    ...workspaceAuthorization(workspaceAuthKey),
   });
 }
 

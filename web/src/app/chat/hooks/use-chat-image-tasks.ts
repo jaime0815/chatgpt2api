@@ -389,7 +389,12 @@ export function useChatImageTasks({
     async (messages: readonly ChatMessage[]) => {
       const pending: ChatMessage[] = []
       for (const storedMessage of messages) {
-        const current = messagesRef.current.get(storedMessage.id) || storedMessage
+        // A live message may be persisted before its task creation request finishes.
+        // Its submit path owns polling, so a recovery snapshot must not race it.
+        if (messagesRef.current.has(storedMessage.id)) {
+          continue
+        }
+        const current = storedMessage
         if (pendingTaskIds(current).length === 0) {
           continue
         }
