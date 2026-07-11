@@ -214,8 +214,9 @@ export function useChatImageTasks({
   }, [])
 
   const pollMessage = useCallback(
-    async (messageId: string) => {
+    async (messageId: string, immediate = false) => {
       let consecutiveErrors = 0
+      let firstRequest = true
       while (!disposedRef.current) {
         const current = messagesRef.current.get(messageId)
         if (!current) {
@@ -225,7 +226,7 @@ export function useChatImageTasks({
         if (ids.length === 0) {
           return
         }
-        if (pollIntervalMs > 0) {
+        if (pollIntervalMs > 0 && (!immediate || !firstRequest)) {
           await dependenciesRef.current.wait(pollIntervalMs)
         }
         if (disposedRef.current) {
@@ -233,6 +234,7 @@ export function useChatImageTasks({
         }
         try {
           const taskList = await dependenciesRef.current.fetchImageTasks(ids)
+          firstRequest = false
           consecutiveErrors = 0
           let next = messagesRef.current.get(messageId) || current
           for (const task of taskList.items) {
@@ -243,6 +245,7 @@ export function useChatImageTasks({
           }
           await emit(next)
         } catch (error) {
+          firstRequest = false
           consecutiveErrors += 1
           if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
             const latest = messagesRef.current.get(messageId)
@@ -258,12 +261,12 @@ export function useChatImageTasks({
   )
 
   const ensurePolling = useCallback(
-    (messageId: string) => {
+    (messageId: string, immediate = false) => {
       const existing = pollersRef.current.get(messageId)
       if (existing) {
         return existing
       }
-      const poller = pollMessage(messageId).finally(() => {
+      const poller = pollMessage(messageId, immediate).finally(() => {
         if (pollersRef.current.get(messageId) === poller) {
           pollersRef.current.delete(messageId)
         }
@@ -380,41 +383,19 @@ export function useChatImageTasks({
 
   const recoverImageMessages = useCallback(
     async (messages: readonly ChatMessage[]) => {
-      const pending = messages.filter((message) => pendingTaskIds(message).length > 0)
-      for (const message of pending) {
-        messagesRef.current.set(message.id, message)
-      }
-      const taskIds = [...new Set(pending.flatMap(pendingTaskIds))]
-      if (taskIds.length === 0) {
-        return []
-      }
-      try {
-        const taskList = await dependenciesRef.current.fetchImageTasks(taskIds)
-        const nextMessages: ChatMessage[] = []
-        for (const message of pending) {
-          let next = message
-          for (const task of taskList.items) {
-            next = applyImageTaskToChatMessage(next, task)
-          }
-          const messageTaskIds = new Set(pendingTaskIds(next))
-          const missing = taskList.missing_ids.filter((id) => messageTaskIds.has(id))
-          if (missing.length > 0) {
-            next = setMissingTaskErrors(next, missing)
-          }
-          nextMessages.push(await emit(next))
-          if (pendingTaskIds(next).length > 0) {
-            void ensurePolling(next.id)
-          }
+      const pending: ChatMessage[] = []
+      for (const storedMessage of messages) {
+        const current = messagesRef.current.get(storedMessage.id) || storedMessage
+        if (pendingTaskIds(current).length === 0) {
+          continue
         }
-        return nextMessages
-      } catch {
-        for (const message of pending) {
-          void ensurePolling(message.id)
-        }
-        return pending
+        messagesRef.current.set(current.id, current)
+        pending.push(current)
+        void ensurePolling(current.id, true)
       }
+      return pending
     },
-    [emit, ensurePolling],
+    [ensurePolling],
   )
 
   const resumeImageTask = useCallback(

@@ -334,6 +334,48 @@ describe("useChatImageTasks", () => {
     expect(dependencies.fetchImageTasks).toHaveBeenCalledTimes(2)
   })
 
+  it("does not let a second stale recovery overwrite a completed image message", async () => {
+    const dependencies = createDependencies()
+    dependencies.fetchImageTasks = vi
+      .fn()
+      .mockResolvedValueOnce({ items: [task("recover-task", "success")], missing_ids: [] })
+      .mockResolvedValue({ items: [task("recover-task", "running")], missing_ids: [] })
+    dependencies.wait = vi.fn(() => new Promise<void>(() => undefined))
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const stale: ChatMessage = {
+      id: "assistant-double-recover",
+      role: "assistant",
+      text: "",
+      attachmentIds: [],
+      status: "running",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      images: [{ id: "recover-image", taskId: "recover-task", status: "running" }],
+    }
+    const { result, unmount } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 1 }),
+    )
+
+    try {
+      await act(async () => {
+        await result.current.recoverImageMessages([stale])
+      })
+      await waitFor(() => expect(onMessageChange).toHaveBeenLastCalledWith(
+        expect.objectContaining({ status: "complete" }),
+      ))
+
+      await act(async () => {
+        await result.current.recoverImageMessages([stale])
+      })
+
+      expect(onMessageChange).toHaveBeenLastCalledWith(
+        expect.objectContaining({ status: "complete" }),
+      )
+      expect(dependencies.fetchImageTasks).toHaveBeenCalledTimes(1)
+    } finally {
+      unmount()
+    }
+  })
+
   it("rejects documents and more than ten reference images before submitting a task", async () => {
     const dependencies = createDependencies()
     const { result } = renderHook(() =>
