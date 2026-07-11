@@ -6,9 +6,15 @@ from unittest import mock
 
 import pytest
 import requests
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+import api.ai as ai_module
 from services.protocol import openai_v1_models
 from test.live_compat_api import SKIP_REASON, enabled, load_target
+
+
+AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
 
 
 class ModelListTests(unittest.TestCase):
@@ -59,6 +65,30 @@ class ModelListTests(unittest.TestCase):
         self.assertIn("gpt-image-2", ids)
         self.assertNotIn("codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
+
+    def test_models_refresh_sets_no_store_header(self):
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        client = TestClient(app)
+        payload = {"object": "list", "data": [{"id": "gpt-test", "object": "model"}]}
+
+        with mock.patch.object(ai_module.openai_v1_models, "list_models", return_value=payload):
+            response = client.get("/v1/models?refresh=1", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_models_refresh_forwards_explicit_refresh_intent(self):
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        client = TestClient(app)
+        payload = {"object": "list", "data": []}
+
+        with mock.patch.object(ai_module.openai_v1_models, "list_models", return_value=payload) as list_models:
+            response = client.get("/v1/models?refresh=1", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        list_models.assert_called_once_with(refresh=True)
 
     @pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
     def test_list_models_http(self):

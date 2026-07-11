@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
@@ -81,10 +81,14 @@ def create_router() -> APIRouter:
     router = APIRouter()
 
     @router.get("/v1/models")
-    async def list_models(authorization: str | None = Header(default=None)):
+    async def list_models(
+            refresh: bool = False,
+            authorization: str | None = Header(default=None),
+    ):
         require_identity(authorization)
         try:
-            return await run_in_threadpool(openai_v1_models.list_models)
+            payload = await run_in_threadpool(openai_v1_models.list_models, refresh=refresh)
+            return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 

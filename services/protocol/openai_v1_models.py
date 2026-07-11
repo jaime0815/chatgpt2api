@@ -7,7 +7,13 @@ from services.openai_backend_api import OpenAIBackendAPI
 from utils.helper import CODEX_IMAGE_MODEL
 
 
-def list_models() -> dict[str, Any]:
+def list_models(*, refresh: bool = False) -> dict[str, Any]:
+    """Discover the current upstream model directory for each request.
+
+    ``refresh`` records an explicit client refresh request. The upstream call is
+    intentionally made for both paths, so no process-local catalog can become
+    stale.
+    """
     backend = OpenAIBackendAPI()
     try:
         result = backend.list_models()
