@@ -85,6 +85,24 @@ export BUILDPLATFORM="linux/$TARGETARCH"
 export TARGETPLATFORM="linux/$TARGETARCH"
 export TARGETARCH
 
+DEFAULT_HOST_ROOT="/etc/chatgpt2api"
+REPO_CONFIG_FILE="./config.json"
+REPO_DATA_DIR="./data"
+
+HOST_DATA_DIR="${CHATGPT2API_HOST_DATA_DIR:-$DEFAULT_HOST_ROOT/data}"
+HOST_CONFIG_FILE="${CHATGPT2API_HOST_CONFIG_FILE:-$DEFAULT_HOST_ROOT/config.json}"
+
+mkdir -p "$HOST_DATA_DIR"
+mkdir -p "$(dirname "$HOST_CONFIG_FILE")"
+
+if [[ ! -e "$HOST_CONFIG_FILE" && -f "$REPO_CONFIG_FILE" ]]; then
+  cp "$REPO_CONFIG_FILE" "$HOST_CONFIG_FILE"
+fi
+
+if [[ -d "$REPO_DATA_DIR" && -z "$(find "$HOST_DATA_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  cp -a "$REPO_DATA_DIR"/. "$HOST_DATA_DIR"/
+fi
+
 if docker compose version >/dev/null 2>&1; then
   COMPOSE_CMD=(docker compose)
   COMPOSE_IMPL="v2"

@@ -13,8 +13,12 @@ services:
     ports:
       - "3000:80"
     volumes:
-      - ./data:/app/data
-      - ./config.json:/app/config.json
+      - type: bind
+        source: ${CHATGPT2API_HOST_DATA_DIR:-/etc/chatgpt2api/data}
+        target: /app/data
+      - type: bind
+        source: ${CHATGPT2API_HOST_CONFIG_FILE:-/etc/chatgpt2api/config.json}
+        target: /app/config.json
     environment:
       STORAGE_BACKEND: sqlite
       DATABASE_URL: sqlite:////app/data/accounts.db

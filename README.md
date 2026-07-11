@@ -27,6 +27,8 @@ cd chatgpt2api
 
 启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.local.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
+Docker 默认通过 bind mount 直接使用宿主机目录保存号池、图片、日志和 SQLite 数据；默认映射 `/etc/chatgpt2api/data -> /app/data`、`/etc/chatgpt2api/config.json -> /app/config.json`，也可以通过 `CHATGPT2API_HOST_DATA_DIR` 和 `CHATGPT2API_HOST_CONFIG_FILE` 改成其他 host 路径。首次切换到该默认目录时，启动脚本会在目标不存在时自动从仓库当前的 `config.json` 和 `data/` 迁移一份初始数据。
+
 如需跳过镜像重建，可显式关闭：
 
 ```bash
@@ -42,7 +44,7 @@ cd chatgpt2api
 - Web 面板：`http://localhost:3000/chatgpt2api/`
 - 普通用户聊天：`http://localhost:3000/chatgpt2api/chat/`（普通用户登录后的默认入口）
 - API 地址：`http://localhost:3000/chatgpt2api/v1`
-- 数据目录：`./data`
+- 数据目录：`/etc/chatgpt2api/data`
 
 Web 面板和同源 API 默认挂在 `/chatgpt2api` 子路径下，便于 nginx redirect/反向代理。普通用户登录后会进入该 `basePath` 下的 `/chat` 路由；按默认配置即为 `/chatgpt2api/chat/`。页面、`/_next` 静态资源、public 图标和同源 `/api`、`/v1` 请求都会走同一前缀：
 

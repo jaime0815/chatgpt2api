@@ -28,6 +28,13 @@ git --version
 
 升级和迁移时重点保留以上内容。
 
+Docker Compose 默认使用 host bind mount 保存运行数据：
+
+- `${CHATGPT2API_HOST_DATA_DIR:-/etc/chatgpt2api/data}` 挂载到容器 `/app/data`
+- `${CHATGPT2API_HOST_CONFIG_FILE:-/etc/chatgpt2api/config.json}` 挂载到容器 `/app/config.json`
+
+其中 `data/` 会保存号池、图片、日志、任务记录和本地 SQLite 数据库。需要改到其他宿主机目录时，在 `.env` 中覆盖这两个变量即可。首次切到默认的 `/etc/chatgpt2api/` 前缀时，启动脚本会在目标文件或目录不存在时，从仓库当前的 `config.json` 和 `data/` 复制一份初始内容。
+
 ## 统一启动脚本
 
 仓库内置了统一入口脚本：
