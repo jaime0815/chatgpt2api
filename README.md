@@ -139,8 +139,9 @@ environment:
 
 - 普通用户登录后默认进入 `/chat`，提供接近 ChatGPT 的多轮消息流界面和模型选择。
 - 文本流可在浏览器中停止；已完成或失败的助手回复可重试，用户消息可编辑后重新发送。
-- 聊天记录、当前会话、模型偏好和滚动位置只保存在当前浏览器，并按登录用户的 `subject_id` 分区；不会作为服务端聊天历史同步到其他浏览器或设备。
-- 图片生成/编辑模式复用既有画图工作台的模型、质量、尺寸/比例和生成数量设置。参考图最多 10 张，生成数量沿用既有的 `1-100` 参数范围。
+- 聊天记录、当前会话、模型偏好、图片设置和滚动位置只保存在当前浏览器，并按登录用户的 `subject_id` 分区；不会作为服务端聊天历史同步到其他浏览器或设备。
+- 支持删除单个会话或清空当前用户在本浏览器中的全部聊天记录；清空时会一并丢弃关联的本地附件缓存和进行中的图片任务。
+- 图片生成/编辑模式复用既有画图工作台的模型、质量、尺寸/比例和生成数量设置，但聊天图片设置会按 `subject_id` 独立保存，不读取旧的全局画图设置。参考图最多 10 张，生成数量沿用既有的 `1-100` 参数范围。
 - 文本聊天附件（包括文档）尚未接入真实上游 uploader，不能视为已支持的能力。聊天页面会提示移除附件；若直接向 `/api/chat/stream` 发送附件，流会返回 `attachment_unavailable` 错误事件。PDF、Office 等文档不能用于当前普通文本聊天。
 
 #### 可选实时聊天附件冒烟测试
@@ -161,6 +162,23 @@ uv run pytest -q test/test_web_chat_live.py -s
 ```
 
 文本流用例应在可用账号下完成。当前附件用例在检测到 `attachment_unavailable` 时预期为 `xfail`；缺少外部凭证、可用账号或真实夹具时会跳过。因此该命令不能作为 PDF/Office 附件已可用的证明。
+
+#### 可选兼容 API 实测
+
+兼容 API 的真实网络请求默认不运行，因此常规 `pytest -q test` 不依赖本机服务、上游账号或外部图片。需要针对已配置服务做实测时，显式设置 `RUN_LIVE_COMPAT_API=1` 并提供目标、授权、模型和图片夹具。`LIVE_COMPAT_API_BASE_URL` 可以是包含反向代理 `basePath` 的服务地址，也可以以 `/v1` 结尾；测试会避免重复拼接 `/v1`。
+
+```bash
+RUN_LIVE_COMPAT_API=1 \
+LIVE_COMPAT_API_BASE_URL='https://service.example/v1' \
+LIVE_COMPAT_API_AUTHORIZATION='Bearer <auth-key>' \
+LIVE_COMPAT_API_TEXT_MODEL='<text-model>' \
+LIVE_COMPAT_API_IMAGE_MODEL='<image-model>' \
+LIVE_COMPAT_API_CODEX_IMAGE_MODEL='<codex-image-model>' \
+LIVE_COMPAT_API_IMAGE_FILES='/absolute/path/to/image-01.png:/absolute/path/to/image-02.png' \
+uv run pytest -q test/test_v1_chat_completions.py test/test_v1_images_generations.py test/test_v1_images_edits.py test/test_v1_messages.py test/test_v1_models.py test/test_v1_responses.py -s
+```
+
+该实测会发送真实请求，可能消耗账号额度。不要把授权值写入仓库、配置模板、测试代码或文档；缺少 opt-in、必填参数或图片夹具时，对应用例会跳过而不会访问默认上游。
 
 ### 号池管理功能
 
