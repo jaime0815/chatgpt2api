@@ -4,7 +4,9 @@ services:
     container_name: chatgpt2api-warp-init
     working_dir: /app
     volumes:
-      - ./config.json:/app/config.json
+      - type: bind
+        source: ${CHATGPT2API_HOST_CONFIG_FILE:-/etc/chatgpt2api/config.json}
+        target: /app/config.json
       - ./scripts:/app/scripts:ro
     environment:
       CHATGPT2API_CONFIG_FILE: /app/config.json
@@ -87,6 +89,9 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        BUILDPLATFORM: ${BUILDPLATFORM:-linux/amd64}
+        TARGETPLATFORM: ${TARGETPLATFORM:-linux/amd64}
+        TARGETARCH: ${TARGETARCH:-amd64}
         NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-/chatgpt2api}
     image: chatgpt2api:warp
     container_name: chatgpt2api-warp
@@ -101,8 +106,12 @@ services:
     ports:
       - "${CHATGPT2API_PORT:-3000}:80"
     volumes:
-      - ./data:/app/data
-      - ./config.json:/app/config.json
+      - type: bind
+        source: ${CHATGPT2API_HOST_DATA_DIR:-/etc/chatgpt2api/data}
+        target: /app/data
+      - type: bind
+        source: ${CHATGPT2API_HOST_CONFIG_FILE:-/etc/chatgpt2api/config.json}
+        target: /app/config.json
     environment:
       STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
       DATABASE_URL: ${DATABASE_URL:-}
