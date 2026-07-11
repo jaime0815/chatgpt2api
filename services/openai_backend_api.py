@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Literal, Optional
 from urllib.parse import unquote, urlparse
 
 from curl_cffi import requests
@@ -638,6 +638,50 @@ class OpenAIBackendAPI:
         for item in messages:
             role = item.get("role", "user")
             content = item.get("content", "")
+            stream_attachments = item.get("attachments")
+            if stream_attachments:
+                if not isinstance(content, str):
+                    raise RuntimeError("stream chat attachment content must be text")
+                if not isinstance(stream_attachments, list):
+                    raise RuntimeError("invalid stream chat attachments")
+                metadata_attachments: list[Dict[str, Any]] = []
+                image_parts: list[Dict[str, Any]] = []
+                for attachment in stream_attachments:
+                    if not isinstance(attachment, dict):
+                        raise RuntimeError("invalid resolved chat attachment")
+                    metadata_attachment = attachment.get("metadata_attachment")
+                    if not isinstance(metadata_attachment, dict):
+                        raise RuntimeError("invalid resolved chat attachment metadata")
+                    kind = attachment.get("kind")
+                    if kind == "image":
+                        content_part = attachment.get("content_part")
+                        if (
+                            not isinstance(content_part, dict)
+                            or content_part.get("content_type") != "image_asset_pointer"
+                        ):
+                            raise RuntimeError("invalid resolved chat image attachment")
+                        image_parts.append(dict(content_part))
+                    elif kind != "document":
+                        raise RuntimeError("invalid resolved chat attachment kind")
+                    metadata_attachments.append(dict(metadata_attachment))
+
+                if image_parts:
+                    parts: list[Any] = image_parts
+                    if content:
+                        parts.append(content)
+                    conversation_content: Dict[str, Any] = {
+                        "content_type": "multimodal_text",
+                        "parts": parts,
+                    }
+                else:
+                    conversation_content = {"content_type": "text", "parts": [content]}
+                conversation_messages.append({
+                    "id": new_uuid(),
+                    "author": {"role": role},
+                    "content": conversation_content,
+                    "metadata": {"attachments": metadata_attachments},
+                })
+                continue
             if isinstance(content, str):
                 conversation_messages.append({
                     "id": new_uuid(),
@@ -1098,6 +1142,222 @@ class OpenAIBackendAPI:
                 return file_path.read_bytes()
         payload = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
         return base64.b64decode(payload)
+
+    def _chat_attachment_response_ok(
+        self,
+        response: Any,
+        *,
+        context: str,
+        authenticated_request: bool,
+    ) -> None:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if 200 <= status_code < 300:
+            return
+        if authenticated_request and status_code == 401:
+            raise InvalidAccessTokenError("token invalidated (chat attachment)")
+        # Do not preserve upstream response bodies here. They can contain signed URLs,
+        # file identifiers, or account-specific diagnostics.
+        raise UpstreamHTTPError(context, status_code or 502, {"detail": "upstream attachment request failed"})
+
+    def _chat_attachment_blob_headers(self, mime_type: str) -> Dict[str, str]:
+        return {
+            "Content-Type": mime_type,
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-version": "2020-04-08",
+            "Origin": self.base_url,
+            "Referer": self.base_url + "/",
+            "User-Agent": self.user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.8",
+        }
+
+    @staticmethod
+    def _chat_attachment_request(context: str, request: Callable[[], Any]) -> Any:
+        try:
+            return request()
+        except (InvalidAccessTokenError, UpstreamHTTPError):
+            raise
+        except Exception:
+            raise RuntimeError(f"{context} request failed") from None
+
+    def _process_chat_attachment_document(self, file_id: str, file_name: str) -> None:
+        path = "/backend-api/files/process_upload_stream"
+        response = self._chat_attachment_request(
+            "chat attachment processing",
+            lambda: self.session.post(
+                self.base_url + path,
+                headers=self._headers(path, {"Accept": "text/event-stream", "Content-Type": "application/json"}),
+                json={
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "use_case": "multimodal",
+                    "index_for_retrieval": True,
+                    "entry_surface": "composer",
+                },
+                timeout=120,
+                stream=True,
+            ),
+        )
+        try:
+            self._chat_attachment_response_ok(
+                response,
+                context="chat attachment processing",
+                authenticated_request=True,
+            )
+            completed = False
+            done = False
+            for payload in iter_sse_payloads(response):
+                if payload == "[DONE]":
+                    done = True
+                    break
+                try:
+                    event = json.loads(payload)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_name = str(event.get("event") or "")
+                status = str(event.get("status") or "").lower()
+                if event_name == "file.processing.completed" and status in {"success", "completed", "succeeded"}:
+                    completed = True
+                if status in {"error", "failed", "failure"} or event_name.endswith(".failed"):
+                    break
+            if not completed or not done:
+                raise UpstreamHTTPError(
+                    "chat attachment processing",
+                    502,
+                    {"detail": "upstream attachment processing did not complete"},
+                )
+        finally:
+            self._close_stream_response(response)
+
+    def upload_chat_attachment_bytes(
+        self,
+        data: bytes,
+        file_name: str,
+        mime_type: str,
+        kind: Literal["image", "document"] | str,
+    ) -> Dict[str, Any]:
+        """Upload one normal-chat attachment and return a server-only descriptor."""
+        if not self.access_token:
+            raise RuntimeError("authenticated upstream account required for chat attachment")
+        if kind not in {"image", "document"}:
+            raise RuntimeError("unsupported chat attachment kind")
+        if not data:
+            raise RuntimeError("chat attachment data is empty")
+
+        width: int | None = None
+        height: int | None = None
+        if kind == "image":
+            try:
+                image = Image.open(BytesIO(data))
+                width, height = image.size
+            except Exception:
+                raise RuntimeError("chat image attachment is invalid") from None
+
+        create_request: Dict[str, Any] = {
+            "file_name": file_name,
+            "file_size": len(data),
+            "mime_type": mime_type,
+            "use_case": "multimodal",
+        }
+        if kind == "image":
+            create_request["width"] = width
+            create_request["height"] = height
+
+        create_path = "/backend-api/files"
+        response = self._chat_attachment_request(
+            "chat attachment creation",
+            lambda: self.session.post(
+                self.base_url + create_path,
+                headers=self._headers(create_path, {"Content-Type": "application/json", "Accept": "application/json"}),
+                json=create_request,
+                timeout=60,
+            ),
+        )
+        self._chat_attachment_response_ok(
+            response,
+            context="chat attachment creation",
+            authenticated_request=True,
+        )
+        try:
+            create_payload = response.json()
+        except Exception:
+            raise RuntimeError("invalid chat attachment creation response") from None
+        if not isinstance(create_payload, dict):
+            raise RuntimeError("invalid chat attachment creation response")
+        file_id = str(create_payload.get("file_id") or "")
+        upload_url = str(create_payload.get("upload_url") or "")
+        if not file_id or not upload_url:
+            raise RuntimeError("invalid chat attachment creation response")
+
+        response = self._chat_attachment_request(
+            "chat attachment upload",
+            lambda: self.session.put(
+                upload_url,
+                headers=self._chat_attachment_blob_headers(mime_type),
+                data=data,
+                timeout=120,
+            ),
+        )
+        self._chat_attachment_response_ok(
+            response,
+            context="chat attachment upload",
+            authenticated_request=False,
+        )
+
+        confirm_path = f"/backend-api/files/{file_id}/uploaded"
+        response = self._chat_attachment_request(
+            "chat attachment confirmation",
+            lambda: self.session.post(
+                self.base_url + confirm_path,
+                headers=self._headers(confirm_path, {"Content-Type": "application/json", "Accept": "application/json"}),
+                data="{}",
+                timeout=60,
+            ),
+        )
+        self._chat_attachment_response_ok(
+            response,
+            context="chat attachment confirmation",
+            authenticated_request=True,
+        )
+
+        if kind == "document":
+            self._process_chat_attachment_document(file_id, file_name)
+            metadata_attachment: Dict[str, Any] = {
+                "id": file_id,
+                "name": file_name,
+                "mime_type": mime_type,
+                "size": len(data),
+                "is_big_paste": False,
+            }
+            library_file_id = str(create_payload.get("library_file_id") or "")
+            if library_file_id:
+                metadata_attachment["library_file_id"] = library_file_id
+            return {
+                "kind": "document",
+                "metadata_attachment": metadata_attachment,
+            }
+
+        assert width is not None and height is not None
+        return {
+            "kind": "image",
+            "content_part": {
+                "content_type": "image_asset_pointer",
+                "asset_pointer": f"file-service://{file_id}",
+                "width": width,
+                "height": height,
+                "size_bytes": len(data),
+            },
+            "metadata_attachment": {
+                "id": file_id,
+                "mimeType": mime_type,
+                "name": file_name,
+                "size": len(data),
+                "width": width,
+                "height": height,
+            },
+        }
 
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
         """上传一张 base64 图片，返回底层文件元数据。"""

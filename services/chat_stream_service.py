@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import Any, Protocol
 
 from services.account_service import account_service
+from services.chat_attachments import ChatAttachmentUploader
 from services.chat_types import ChatAttachmentBlob, ChatMessage, ChatStreamCommand
 from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 from services.protocol.conversation import is_token_invalid_error, iter_conversation_payloads
@@ -129,7 +130,7 @@ class ChatStreamSession:
         self.command = command
         self._account_provider = account_provider
         self._backend_factory = backend_factory
-        self._attachment_uploader = attachment_uploader
+        self._attachment_uploader = attachment_uploader or ChatAttachmentUploader()
 
         self._lock = threading.RLock()
         self._cancelled = threading.Event()
@@ -359,8 +360,6 @@ class ChatStreamSession:
     ) -> Mapping[str, Any]:
         if not attachments:
             return {}
-        if self._attachment_uploader is None:
-            raise RuntimeError("attachment_uploader is required for attachment chat")
         resolved = self._attachment_uploader.resolve(backend, attachments)
         if not isinstance(resolved, Mapping):
             raise RuntimeError("attachment uploader returned an invalid mapping")
