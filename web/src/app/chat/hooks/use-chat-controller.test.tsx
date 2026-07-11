@@ -1,4 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react"
+import { useLayoutEffect, useRef } from "react"
 import { describe, expect, it, vi } from "vitest"
 
 import type {
@@ -16,7 +17,16 @@ import {
 } from "./use-chat-controller"
 
 const SUBJECT_ID = "alice@example.com"
+const OTHER_SUBJECT_ID = "bob@example.com"
 const START_TIME = Date.parse("2026-07-11T08:00:00.000Z")
+
+function deferred<Value>() {
+  let resolve!: (value: Value) => void
+  const promise = new Promise<Value>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
 
 function attachment(character: string, name = `${character}.txt`): PreparedChatAttachment {
   const sha256 = character.repeat(64)
@@ -639,5 +649,149 @@ describe("useChatController", () => {
       expect.objectContaining({ text: "still answered", status: "complete" }),
     ])
     expect(streamChatFn.mock.calls[0]?.[1]).toEqual([newAttachment])
+  })
+
+  it("isolates the rendered state and blocks writes during a synchronous subject switch", async () => {
+    const oldConversation = conversation("alice-conversation", [
+      message("alice-user", "user", "alice-only history"),
+    ])
+    const otherConversations = deferred<ChatConversation[]>()
+    const otherPreferences = deferred<ChatPreferences>()
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({
+      conversations: [oldConversation],
+      preferences: { activeConversationId: oldConversation.id },
+      streamChatFn,
+    })
+    dependencies.listConversations = vi.fn((subjectId) =>
+      subjectId === OTHER_SUBJECT_ID
+        ? otherConversations.promise
+        : Promise.resolve([oldConversation]),
+    )
+    dependencies.getPreferences = vi.fn((subjectId) =>
+      subjectId === OTHER_SUBJECT_ID
+        ? otherPreferences.promise
+        : Promise.resolve({
+            activeConversationId: oldConversation.id,
+            selectedModel: "gpt-5.2",
+            scrollPositions: {},
+          }),
+    )
+
+    let visibleSubject = ""
+    let visibleConversationCount = -1
+    let visibleActiveConversationId: string | null | undefined
+    let pendingSend: Promise<void> | undefined
+    const hook = renderHook(
+      ({ subjectId }: { subjectId: string }) => {
+        const controller = useChatController({ subjectId, dependencies })
+        const attemptedRef = useRef(false)
+        useLayoutEffect(() => {
+          if (subjectId !== OTHER_SUBJECT_ID || attemptedRef.current) {
+            return
+          }
+          attemptedRef.current = true
+          visibleSubject = controller.state.subjectId
+          visibleConversationCount = controller.state.conversations.length
+          visibleActiveConversationId = controller.activeConversation?.id
+          pendingSend = controller.sendText({ text: "must not cross subjects" })
+        }, [controller, subjectId])
+        return controller
+      },
+      { initialProps: { subjectId: SUBJECT_ID } },
+    )
+    await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
+
+    act(() => {
+      hook.rerender({ subjectId: OTHER_SUBJECT_ID })
+    })
+
+    expect(visibleSubject).toBe(OTHER_SUBJECT_ID)
+    expect(visibleConversationCount).toBe(0)
+    expect(visibleActiveConversationId).toBeUndefined()
+    expect(pendingSend).toBeDefined()
+    await expect(pendingSend).resolves.toBeUndefined()
+    expect(streamChatFn).not.toHaveBeenCalled()
+    expect(dependencies.saveConversation).not.toHaveBeenCalled()
+
+    await act(async () => {
+      otherConversations.resolve([])
+      otherPreferences.resolve({
+        activeConversationId: null,
+        selectedModel: "auto",
+        scrollPositions: {},
+      })
+    })
+    await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
+  })
+
+  it("does not resurrect a deleted conversation after slow attachment persistence", async () => {
+    const pendingAttachment = deferred<PreparedChatAttachment>()
+    const newAttachment = attachment("e", "slow-delete.txt")
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies, storedConversations } = createDependencies({ streamChatFn })
+    dependencies.saveAttachment = vi.fn<ChatControllerDependencies["saveAttachment"]>(
+      async (_subjectId, item) => {
+        await pendingAttachment.promise
+        return item
+      },
+    )
+    const { result } = await renderController(dependencies)
+    let sending!: Promise<void>
+
+    act(() => {
+      sending = result.current.sendText({ text: "delete while saving", attachments: [newAttachment] })
+    })
+    await waitFor(() => expect(dependencies.saveAttachment).toHaveBeenCalledTimes(1))
+    const conversationId = result.current.state.activeConversationId
+    expect(conversationId).toBeTruthy()
+
+    await act(async () => {
+      await result.current.deleteConversation(conversationId!)
+      pendingAttachment.resolve(newAttachment)
+      await sending
+    })
+
+    expect(storedConversations.has(conversationId!)).toBe(false)
+    expect(dependencies.saveConversation).not.toHaveBeenCalled()
+    expect(streamChatFn).not.toHaveBeenCalled()
+  })
+
+  it("does not resurrect a cleared conversation after slow attachment persistence", async () => {
+    const pendingAttachment = deferred<PreparedChatAttachment>()
+    const newAttachment = attachment("f", "slow-clear.txt")
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies, storedConversations } = createDependencies({ streamChatFn })
+    dependencies.saveAttachment = vi.fn<ChatControllerDependencies["saveAttachment"]>(
+      async (_subjectId, item) => {
+        await pendingAttachment.promise
+        return item
+      },
+    )
+    const { result } = await renderController(dependencies)
+    let sending!: Promise<void>
+
+    act(() => {
+      sending = result.current.sendText({ text: "clear while saving", attachments: [newAttachment] })
+    })
+    await waitFor(() => expect(dependencies.saveAttachment).toHaveBeenCalledTimes(1))
+    const conversationId = result.current.state.activeConversationId
+    expect(conversationId).toBeTruthy()
+
+    await act(async () => {
+      await result.current.clearHistory()
+      pendingAttachment.resolve(newAttachment)
+      await sending
+    })
+
+    expect(storedConversations.has(conversationId!)).toBe(false)
+    expect(dependencies.saveConversation).not.toHaveBeenCalled()
+    expect(streamChatFn).not.toHaveBeenCalled()
   })
 })

@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react"
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef } from "react"
 
 import { streamChat } from "@/app/chat/lib/chat-stream"
 import type {
@@ -112,6 +112,8 @@ type ChatControllerAction =
   | { type: "set-warning"; warning: string | null }
 
 type ActiveRun = ChatActiveStream & {
+  subjectId: string
+  subjectGeneration: number
   token: symbol
   abortController: AbortController
   terminal: Extract<ChatMessageStatus, "complete" | "stopped" | "error"> | null
@@ -506,6 +508,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
 
   const [state, reactDispatch] = useReducer(chatControllerReducer, subjectId, emptyState)
   const stateRef = useRef(state)
+  const subjectSessionRef = useRef({ subjectId, generation: 0 })
   const activeRunRef = useRef<ActiveRun | null>(null)
   const attachmentCacheRef = useRef(new Map<string, PreparedChatAttachment>())
   const checkpointTimersRef = useRef(
@@ -523,6 +526,24 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     stateRef.current = state
   }, [state])
 
+  useLayoutEffect(() => {
+    if (subjectSessionRef.current.subjectId !== subjectId) {
+      subjectSessionRef.current = {
+        subjectId,
+        generation: subjectSessionRef.current.generation + 1,
+      }
+    }
+  }, [subjectId])
+
+  const isSubjectReady = useCallback(() => {
+    const session = subjectSessionRef.current
+    return (
+      session.subjectId === subjectId &&
+      stateRef.current.subjectId === subjectId &&
+      !stateRef.current.isLoading
+    )
+  }, [subjectId])
+
   const clearCheckpoint = useCallback((conversationId: string) => {
     const timer = checkpointTimersRef.current.get(conversationId)
     if (timer !== undefined) {
@@ -533,10 +554,16 @@ export function useChatController({ subjectId, dependencies }: UseChatController
 
   const attemptStorageWrite = useCallback(
     async <T,>(operation: () => Promise<T>) => {
+      const operationSession = subjectSessionRef.current
       try {
         return { ok: true as const, value: await operation() }
       } catch (error) {
-        transition({ type: "set-warning", warning: storageWarning(error) })
+        if (
+          subjectSessionRef.current === operationSession &&
+          stateRef.current.subjectId === operationSession.subjectId
+        ) {
+          transition({ type: "set-warning", warning: storageWarning(error) })
+        }
         return { ok: false as const, value: undefined }
       }
     },
@@ -559,21 +586,85 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     [attemptStorageWrite, subjectId],
   )
 
-  const scheduleCheckpoint = useCallback(
-    (conversation: ChatConversation) => {
-      clearCheckpoint(conversation.id)
-      const timer = globalThis.setTimeout(() => {
-        checkpointTimersRef.current.delete(conversation.id)
-        void persistConversation(conversation)
-      }, dependenciesRef.current.checkpointDelayMs)
-      checkpointTimersRef.current.set(conversation.id, timer)
-    },
-    [clearCheckpoint, persistConversation],
-  )
-
   const conversationFromState = useCallback((id: string) => {
     return stateRef.current.conversations.find((conversation) => conversation.id === id) || null
   }, [])
+
+  const isCurrentRun = useCallback((run: ActiveRun) => {
+    const session = subjectSessionRef.current
+    return (
+      activeRunRef.current?.token === run.token &&
+      session.subjectId === run.subjectId &&
+      session.generation === run.subjectGeneration &&
+      stateRef.current.subjectId === run.subjectId
+    )
+  }, [])
+
+  const conversationForRun = useCallback(
+    (run: ActiveRun, expectedStatus?: ChatMessageStatus) => {
+      if (!isCurrentRun(run)) {
+        return null
+      }
+      const conversation = conversationFromState(run.conversationId)
+      const assistant = conversation?.messages.find(
+        (message) => message.id === run.assistantMessageId,
+      )
+      if (!conversation || !assistant || (expectedStatus && assistant.status !== expectedStatus)) {
+        return null
+      }
+      return conversation
+    },
+    [conversationFromState, isCurrentRun],
+  )
+
+  const activeRunConversation = useCallback(
+    (run: ActiveRun) => {
+      if (run.terminal) {
+        return null
+      }
+      const stream = stateRef.current.activeStream
+      if (
+        stream?.conversationId !== run.conversationId ||
+        stream.assistantMessageId !== run.assistantMessageId
+      ) {
+        return null
+      }
+      const conversation = conversationForRun(run)
+      const assistant = conversation?.messages.find(
+        (message) => message.id === run.assistantMessageId,
+      )
+      if (assistant?.status !== "sending" && assistant?.status !== "streaming") {
+        return null
+      }
+      return conversation
+    },
+    [conversationForRun],
+  )
+
+  const persistRunConversation = useCallback(
+    (
+      run: ActiveRun,
+      expectedStatus?: Extract<ChatMessageStatus, "complete" | "stopped" | "error">,
+    ) => {
+      const conversation = expectedStatus
+        ? conversationForRun(run, expectedStatus)
+        : activeRunConversation(run)
+      return conversation ? persistConversation(conversation) : null
+    },
+    [activeRunConversation, conversationForRun, persistConversation],
+  )
+
+  const scheduleCheckpoint = useCallback(
+    (run: ActiveRun, conversation: ChatConversation) => {
+      clearCheckpoint(conversation.id)
+      const timer = globalThis.setTimeout(() => {
+        checkpointTimersRef.current.delete(conversation.id)
+        void persistRunConversation(run)
+      }, dependenciesRef.current.checkpointDelayMs)
+      checkpointTimersRef.current.set(conversation.id, timer)
+    },
+    [clearCheckpoint, persistRunConversation],
+  )
 
   const saveNewAttachments = useCallback(
     async (attachments: readonly PreparedChatAttachment[]) => {
@@ -620,14 +711,11 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       status: Extract<ChatMessageStatus, "complete" | "stopped" | "error">,
       error?: string,
     ) => {
-      if (run.terminal) {
-        return null
-      }
-      run.terminal = status
-      const conversation = conversationFromState(run.conversationId)
+      const conversation = activeRunConversation(run)
       if (!conversation) {
         return null
       }
+      run.terminal = status
       const updatedAt = nextUpdatedAt(conversation, dependenciesRef.current.now())
       const next = transition({
         type: "finish-stream",
@@ -639,18 +727,18 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       clearCheckpoint(run.conversationId)
       return next.conversations.find((item) => item.id === run.conversationId) || null
     },
-    [clearCheckpoint, conversationFromState, transition],
+    [activeRunConversation, clearCheckpoint, transition],
   )
 
   const executeRun = useCallback(
     async (run: ActiveRun, history: readonly ChatMessage[]) => {
       try {
-        const conversation = conversationFromState(run.conversationId)
-        if (!conversation || run.terminal) {
+        if (!activeRunConversation(run)) {
           return
         }
         const attachments = await resolveReferencedAttachments(history)
-        if (run.terminal) {
+        const conversation = activeRunConversation(run)
+        if (!conversation) {
           return
         }
         const request: ChatStreamRequest = {
@@ -666,11 +754,11 @@ export function useChatController({ subjectId, dependencies }: UseChatController
           attachments,
           run.abortController.signal,
         )) {
-          if (run.terminal) {
+          if (!activeRunConversation(run)) {
             break
           }
           if (event.type === "delta") {
-            const current = conversationFromState(run.conversationId)
+            const current = activeRunConversation(run)
             if (!current) {
               break
             }
@@ -685,27 +773,28 @@ export function useChatController({ subjectId, dependencies }: UseChatController
               (item) => item.id === run.conversationId,
             )
             if (checkpoint) {
-              scheduleCheckpoint(checkpoint)
+              scheduleCheckpoint(run, checkpoint)
             }
             continue
           }
 
           receivedTerminal = true
+          const terminalStatus = event.type === "error" ? "error" : "complete"
           const terminal = terminalTransition(
             run,
-            event.type === "error" ? "error" : "complete",
+            terminalStatus,
             event.type === "error" ? event.message : undefined,
           )
           if (terminal) {
-            await persistConversation(terminal)
+            await persistRunConversation(run, terminalStatus)
           }
           break
         }
 
-        if (!receivedTerminal && !run.terminal) {
+        if (!receivedTerminal && activeRunConversation(run)) {
           const terminal = terminalTransition(run, "error", "聊天流意外中断")
           if (terminal) {
-            await persistConversation(terminal)
+            await persistRunConversation(run, "error")
           }
         }
       } catch (error) {
@@ -714,7 +803,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
         }
         const terminal = terminalTransition(run, "error", errorMessage(error))
         if (terminal) {
-          await persistConversation(terminal)
+          await persistRunConversation(run, "error")
         }
       } finally {
         if (activeRunRef.current?.token === run.token) {
@@ -723,8 +812,8 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       }
     },
     [
-      conversationFromState,
-      persistConversation,
+      activeRunConversation,
+      persistRunConversation,
       resolveReferencedAttachments,
       scheduleCheckpoint,
       terminalTransition,
@@ -739,9 +828,13 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       newAttachments: readonly PreparedChatAttachment[],
       releaseAfterPersist = false,
     ) => {
+      if (!isSubjectReady()) {
+        return
+      }
       if (activeRunRef.current && !activeRunRef.current.terminal) {
         throw new Error("当前已有回复正在生成")
       }
+      const subjectSession = subjectSessionRef.current
       const assistantMessage: ChatMessage = {
         id: dependenciesRef.current.createId(),
         role: "assistant",
@@ -759,6 +852,8 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       const run: ActiveRun = {
         conversationId: conversation.id,
         assistantMessageId: assistantMessage.id,
+        subjectId: subjectSession.subjectId,
+        subjectGeneration: subjectSession.generation,
         token: Symbol(assistantMessage.id),
         abortController: new AbortController(),
         terminal: null,
@@ -771,8 +866,8 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       })
 
       await saveNewAttachments(newAttachments)
-      const persisted = await persistConversation(streamingConversation)
-      if (releaseAfterPersist && persisted.ok) {
+      const persisted = await persistRunConversation(run)
+      if (releaseAfterPersist && persisted?.ok) {
         await attemptStorageWrite(() =>
           dependenciesRef.current.releaseUnreferencedAttachments(subjectId),
         )
@@ -782,7 +877,8 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     [
       attemptStorageWrite,
       executeRun,
-      persistConversation,
+      isSubjectReady,
+      persistRunConversation,
       saveNewAttachments,
       subjectId,
       transition,
@@ -835,6 +931,9 @@ export function useChatController({ subjectId, dependencies }: UseChatController
   }, [subjectId, transition])
 
   const createConversation = useCallback(async () => {
+    if (!isSubjectReady()) {
+      return ""
+    }
     const now = dependenciesRef.current.now()
     const id = dependenciesRef.current.createId()
     const conversation: ChatConversation = {
@@ -850,18 +949,24 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     await persistConversation(conversation)
     await persistPreferences(next)
     return id
-  }, [persistConversation, persistPreferences, transition])
+  }, [isSubjectReady, persistConversation, persistPreferences, transition])
 
   const selectConversation = useCallback(
     async (id: string) => {
+      if (!isSubjectReady()) {
+        return
+      }
       const next = transition({ type: "select-conversation", id })
       await persistPreferences(next)
     },
-    [persistPreferences, transition],
+    [isSubjectReady, persistPreferences, transition],
   )
 
   const renameConversation = useCallback(
     async (id: string, title: string) => {
+      if (!isSubjectReady()) {
+        return
+      }
       const normalized = title.trim() || DEFAULT_CONVERSATION_TITLE
       const conversation = conversationFromState(id)
       if (!conversation) {
@@ -873,11 +978,14 @@ export function useChatController({ subjectId, dependencies }: UseChatController
         dependenciesRef.current.renameConversation(subjectId, id, normalized),
       )
     },
-    [attemptStorageWrite, conversationFromState, subjectId, transition],
+    [attemptStorageWrite, conversationFromState, isSubjectReady, subjectId, transition],
   )
 
   const deleteConversation = useCallback(
     async (id: string) => {
+      if (!isSubjectReady()) {
+        return
+      }
       const run = activeRunRef.current
       if (run?.conversationId === id && !run.terminal) {
         run.terminal = "stopped"
@@ -890,11 +998,14 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       )
       await persistPreferences(next)
     },
-    [attemptStorageWrite, clearCheckpoint, persistPreferences, subjectId, transition],
+    [attemptStorageWrite, clearCheckpoint, isSubjectReady, persistPreferences, subjectId, transition],
   )
 
   const sendText = useCallback(
     async (input: ChatMessageInput) => {
+      if (!isSubjectReady()) {
+        return
+      }
       const text = input.text.trim()
       const attachments = uniqueAttachments(input.attachments || [])
       const attachmentIds = uniqueStrings([
@@ -939,10 +1050,13 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       }
       await startRun(prepared, prepared.messages, attachments)
     },
-    [startRun],
+    [isSubjectReady, startRun],
   )
 
   const stop = useCallback(() => {
+    if (!isSubjectReady()) {
+      return
+    }
     const run = activeRunRef.current
     if (!run || run.terminal) {
       return
@@ -950,12 +1064,15 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     const terminal = terminalTransition(run, "stopped")
     run.abortController.abort()
     if (terminal) {
-      void persistConversation(terminal)
+      void persistRunConversation(run, "stopped")
     }
-  }, [persistConversation, terminalTransition])
+  }, [isSubjectReady, persistRunConversation, terminalTransition])
 
   const retryAssistant = useCallback(
     async (assistantMessageId: string) => {
+      if (!isSubjectReady()) {
+        return
+      }
       const conversation = stateRef.current.conversations.find(
         (item) => item.id === stateRef.current.activeConversationId,
       )
@@ -974,11 +1091,14 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       }
       await startRun({ ...conversation, messages: history }, history, [], true)
     },
-    [startRun],
+    [isSubjectReady, startRun],
   )
 
   const editAndResend = useCallback(
     async (userMessageId: string, input: ChatMessageInput) => {
+      if (!isSubjectReady()) {
+        return
+      }
       const conversation = stateRef.current.conversations.find(
         (item) => item.id === stateRef.current.activeConversationId,
       )
@@ -1019,10 +1139,13 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       }
       await startRun(prepared, history, attachments, true)
     },
-    [startRun],
+    [isSubjectReady, startRun],
   )
 
   const clearHistory = useCallback(async () => {
+    if (!isSubjectReady()) {
+      return
+    }
     const run = activeRunRef.current
     if (run && !run.terminal) {
       run.terminal = "stopped"
@@ -1035,10 +1158,13 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     const next = transition({ type: "clear-conversations" })
     await attemptStorageWrite(() => dependenciesRef.current.clearConversations(subjectId))
     await persistPreferences(next)
-  }, [attemptStorageWrite, clearCheckpoint, persistPreferences, subjectId, transition])
+  }, [attemptStorageWrite, clearCheckpoint, isSubjectReady, persistPreferences, subjectId, transition])
 
   const setSelectedModel = useCallback(
     async (model: string) => {
+      if (!isSubjectReady()) {
+        return
+      }
       const normalized = model.trim() || "auto"
       const activeConversation = stateRef.current.conversations.find(
         (item) => item.id === stateRef.current.activeConversationId,
@@ -1055,11 +1181,14 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       }
       await persistPreferences(next)
     },
-    [persistConversation, persistPreferences, transition],
+    [isSubjectReady, persistConversation, persistPreferences, transition],
   )
 
   const setScrollPosition = useCallback(
     async (id: string, scrollTop: number) => {
+      if (!isSubjectReady()) {
+        return
+      }
       const conversation = conversationFromState(id)
       if (!conversation || !Number.isFinite(scrollTop)) {
         return
@@ -1071,24 +1200,31 @@ export function useChatController({ subjectId, dependencies }: UseChatController
       }
       await persistPreferences(next)
     },
-    [conversationFromState, persistConversation, persistPreferences, transition],
+    [conversationFromState, isSubjectReady, persistConversation, persistPreferences, transition],
   )
 
   const clearStorageWarning = useCallback(() => {
+    if (!isSubjectReady()) {
+      return
+    }
     transition({ type: "set-warning", warning: null })
-  }, [transition])
+  }, [isSubjectReady, transition])
+
+  const visibleState = state.subjectId === subjectId ? state : emptyState(subjectId)
 
   const activeConversation = useMemo(
     () =>
-      state.conversations.find((conversation) => conversation.id === state.activeConversationId) ||
+      visibleState.conversations.find(
+        (conversation) => conversation.id === visibleState.activeConversationId,
+      ) ||
       null,
-    [state.activeConversationId, state.conversations],
+    [visibleState.activeConversationId, visibleState.conversations],
   )
 
   return {
-    state,
+    state: visibleState,
     activeConversation,
-    isStreaming: state.activeStream !== null,
+    isStreaming: visibleState.activeStream !== null,
     createConversation,
     selectConversation,
     renameConversation,
