@@ -61,6 +61,14 @@ function task(id: string, status: ImageTask["status"], overrides: Partial<ImageT
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 function createDependencies(overrides: Partial<ChatImageTaskDependencies> = {}) {
   let id = 0
   const dependencies: ChatImageTaskDependencies = {
@@ -334,13 +342,14 @@ describe("useChatImageTasks", () => {
     expect(dependencies.fetchImageTasks).toHaveBeenCalledTimes(2)
   })
 
-  it("does not let a second stale recovery overwrite a completed image message", async () => {
+  it("coalesces concurrent recovery and keeps a late stale response from replacing the first result", async () => {
     const dependencies = createDependencies()
+    const firstFetch = deferred<{ items: ImageTask[]; missing_ids: string[] }>()
+    const lateFetch = deferred<{ items: ImageTask[]; missing_ids: string[] }>()
     dependencies.fetchImageTasks = vi
       .fn()
-      .mockResolvedValueOnce({ items: [task("recover-task", "success")], missing_ids: [] })
-      .mockResolvedValue({ items: [task("recover-task", "running")], missing_ids: [] })
-    dependencies.wait = vi.fn(() => new Promise<void>(() => undefined))
+      .mockImplementationOnce(() => firstFetch.promise)
+      .mockImplementationOnce(() => lateFetch.promise)
     const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
     const stale: ChatMessage = {
       id: "assistant-double-recover",
@@ -352,20 +361,26 @@ describe("useChatImageTasks", () => {
       images: [{ id: "recover-image", taskId: "recover-task", status: "running" }],
     }
     const { result, unmount } = renderHook(() =>
-      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 1 }),
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
     )
 
     try {
+      let firstRecovery!: Promise<ChatMessage[]>
+      let secondRecovery!: Promise<ChatMessage[]>
+      act(() => {
+        firstRecovery = result.current.recoverImageMessages([stale])
+        secondRecovery = result.current.recoverImageMessages([stale])
+      })
+
+      expect(dependencies.fetchImageTasks).toHaveBeenCalledTimes(1)
+      firstFetch.resolve({ items: [task("recover-task", "success")], missing_ids: [] })
+      lateFetch.resolve({ items: [task("recover-task", "running")], missing_ids: [] })
       await act(async () => {
-        await result.current.recoverImageMessages([stale])
+        await Promise.all([firstRecovery, secondRecovery])
       })
       await waitFor(() => expect(onMessageChange).toHaveBeenLastCalledWith(
         expect.objectContaining({ status: "complete" }),
       ))
-
-      await act(async () => {
-        await result.current.recoverImageMessages([stale])
-      })
 
       expect(onMessageChange).toHaveBeenLastCalledWith(
         expect.objectContaining({ status: "complete" }),
