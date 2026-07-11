@@ -58,10 +58,24 @@ class _FakeSession:
         return next(self._responses)
 
 
-class _PutFailureSession(_FakeSession):
+class _SignedUploadTransport:
+    def __init__(self) -> None:
+        self.responses: list[_FakeResponse] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.error: Exception | None = None
+
     def put(self, url: str, **kwargs: Any) -> _FakeResponse:
-        self.calls.append(("put", url, kwargs))
-        raise RuntimeError(f"signed upload failed for {url}")
+        self.calls.append((url, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.responses.pop(0)
+
+
+@pytest.fixture
+def signed_upload(monkeypatch: pytest.MonkeyPatch) -> _SignedUploadTransport:
+    transport = _SignedUploadTransport()
+    monkeypatch.setattr("services.openai_backend_api.requests.put", transport.put)
+    return transport
 
 
 def _backend(responses: list[_FakeResponse]) -> tuple[OpenAIBackendAPI, _FakeSession]:
@@ -71,6 +85,7 @@ def _backend(responses: list[_FakeResponse]) -> tuple[OpenAIBackendAPI, _FakeSes
     backend.session = session
     backend.user_agent = "test-agent"
     backend.access_token = "test-token"
+    backend._session_kwargs = {"impersonate": "chrome110", "verify": True}
     return backend, session
 
 
@@ -100,20 +115,22 @@ def _png(width: int, height: int) -> bytes:
     return output.getvalue()
 
 
-def test_document_upload_processes_before_conversation() -> None:
+def test_document_upload_processes_before_conversation(
+    signed_upload: _SignedUploadTransport,
+) -> None:
     backend, session = _backend([
         _FakeResponse(payload={
             "file_id": "file-secret",
             "upload_url": "https://upload.test/blob?sig=signed-secret",
             "library_file_id": "library-secret",
         }),
-        _FakeResponse(status_code=201),
         _FakeResponse(payload={"status": "success"}),
         _FakeResponse(lines=[
             b'data: {"event":"file.processing.completed","status":"success"}',
             b"data: [DONE]",
         ]),
     ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
 
     uploaded = ChatAttachmentUploader().resolve(backend, (_attachment(),))
 
@@ -132,7 +149,6 @@ def test_document_upload_processes_before_conversation() -> None:
     }
     assert [(method, url) for method, url, _kwargs in session.calls] == [
         ("post", "https://chatgpt.test/backend-api/files"),
-        ("put", "https://upload.test/blob?sig=signed-secret"),
         ("post", "https://chatgpt.test/backend-api/files/file-secret/uploaded"),
         ("post", "https://chatgpt.test/backend-api/files/process_upload_stream"),
     ]
@@ -142,10 +158,28 @@ def test_document_upload_processes_before_conversation() -> None:
         "mime_type": "application/pdf",
         "use_case": "multimodal",
     }
-    assert session.calls[1][2]["data"] == b"%PDF-1.7"
-    assert session.calls[1][2]["headers"]["Content-Type"] == "application/pdf"
-    assert session.calls[2][2]["data"] == "{}"
-    assert session.calls[3][2]["json"] == {
+    assert signed_upload.calls == [
+        ("https://upload.test/blob?sig=signed-secret", {
+            "headers": {
+                "Content-Type": "application/pdf",
+                "Content-Length": "8",
+                "x-ms-blob-type": "BlockBlob",
+                "x-ms-version": "2020-04-08",
+                "Origin": "https://chatgpt.test",
+                "Referer": "https://chatgpt.test/",
+                "User-Agent": "test-agent",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.8",
+            },
+            "data": b"%PDF-1.7",
+            "timeout": 120,
+            "discard_cookies": True,
+            "impersonate": "chrome110",
+            "verify": True,
+        }),
+    ]
+    assert session.calls[1][2]["data"] == "{}"
+    assert session.calls[2][2]["json"] == {
         "file_id": "file-secret",
         "file_name": "sample.pdf",
         "use_case": "multimodal",
@@ -154,16 +188,18 @@ def test_document_upload_processes_before_conversation() -> None:
     }
 
 
-def test_image_upload_returns_asset_pointer_without_document_processing() -> None:
+def test_image_upload_returns_asset_pointer_without_document_processing(
+    signed_upload: _SignedUploadTransport,
+) -> None:
     png = _png(2, 3)
     backend, session = _backend([
         _FakeResponse(payload={
             "file_id": "image-file-secret",
             "upload_url": "https://upload.test/image?sig=image-signed-secret",
         }),
-        _FakeResponse(status_code=201),
         _FakeResponse(payload={"status": "success"}),
     ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
 
     uploaded = backend.upload_chat_attachment_bytes(
         png,
@@ -190,7 +226,7 @@ def test_image_upload_returns_asset_pointer_without_document_processing() -> Non
             "height": 3,
         },
     }
-    assert [method for method, _url, _kwargs in session.calls] == ["post", "put", "post"]
+    assert [method for method, _url, _kwargs in session.calls] == ["post", "post"]
     assert session.calls[0][2]["json"] == {
         "file_name": "reference.png",
         "file_size": len(png),
@@ -201,18 +237,20 @@ def test_image_upload_returns_asset_pointer_without_document_processing() -> Non
     }
 
 
-def test_document_processing_requires_a_complete_success_stream() -> None:
+def test_document_processing_requires_a_complete_success_stream(
+    signed_upload: _SignedUploadTransport,
+) -> None:
     backend, _session = _backend([
         _FakeResponse(payload={
             "file_id": "file-secret",
             "upload_url": "https://upload.test/blob?sig=signed-secret",
         }),
-        _FakeResponse(status_code=201),
         _FakeResponse(payload={"status": "success"}),
         _FakeResponse(lines=[
             b'data: {"event":"file.processing.completed","status":"success"}',
         ]),
     ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
 
     with pytest.raises(UpstreamHTTPError) as captured:
         backend.upload_chat_attachment_bytes(
@@ -223,6 +261,175 @@ def test_document_processing_requires_a_complete_success_stream() -> None:
         )
 
     assert captured.value.status_code == 502
+    assert "file-secret" not in str(captured.value)
+    assert "signed-secret" not in str(captured.value)
+
+
+def test_signed_upload_does_not_send_account_credentials(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            b'data: {"event":"file.processing.completed","status":"success"}',
+            b"data: [DONE]",
+        ]),
+    ])
+    session.headers["Cookie"] = "account-cookie=secret"
+    backend._session_kwargs = {
+        "impersonate": "chrome110",
+        "verify": True,
+        "headers": {"Authorization": "Bearer session-credential", "Cookie": "cookie=secret"},
+        "cookies": {"cookie": "secret"},
+        "auth": ("account", "secret"),
+    }
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    backend.upload_chat_attachment_bytes(
+        b"%PDF-1.7",
+        "sample.pdf",
+        "application/pdf",
+        "document",
+    )
+
+    assert all(method != "put" for method, _url, _kwargs in session.calls)
+    assert len(signed_upload.calls) == 1
+    headers = signed_upload.calls[0][1]["headers"]
+    assert "Authorization" not in headers
+    assert "Cookie" not in headers
+    assert headers["Content-Type"] == "application/pdf"
+    assert headers["Content-Length"] == "8"
+    assert "auth" not in signed_upload.calls[0][1]
+    assert "cookies" not in signed_upload.calls[0][1]
+    assert signed_upload.calls[0][1]["discard_cookies"] is True
+
+
+@pytest.mark.parametrize("status", ["complete", "finished", "finished_successfully"])
+def test_document_processing_accepts_native_success_variants(
+    signed_upload: _SignedUploadTransport,
+    status: str,
+) -> None:
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            f'data: {{"event":"file.processing.completed","status":"{status}"}}'.encode(),
+            b"data: [DONE]",
+        ]),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    uploaded = backend.upload_chat_attachment_bytes(
+        b"%PDF-1.7",
+        "sample.pdf",
+        "application/pdf",
+        "document",
+    )
+
+    assert uploaded["kind"] == "document"
+
+
+@pytest.mark.parametrize(
+    "failure_event",
+    [
+        {"payload": {"error": {"code": "processing_failed"}}},
+        {"payload": {"state": "canceled"}},
+        {"payload": {"success": False}},
+    ],
+)
+def test_document_processing_rejects_nested_failure_after_success(
+    signed_upload: _SignedUploadTransport,
+    failure_event: dict[str, Any],
+) -> None:
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            b'data: {"event":"file.processing.completed","status":"success"}',
+            f"data: {json.dumps(failure_event)}".encode(),
+            b"data: [DONE]",
+        ]),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    with pytest.raises(UpstreamHTTPError) as captured:
+        backend.upload_chat_attachment_bytes(
+            b"%PDF-1.7",
+            "sample.pdf",
+            "application/pdf",
+            "document",
+        )
+
+    assert captured.value.status_code == 502
+    assert "file-secret" not in str(captured.value)
+    assert "signed-secret" not in str(captured.value)
+
+
+@pytest.mark.parametrize("payload", [{"status": "failed"}, {"success": False}])
+def test_unsuccessful_creation_response_does_not_upload_or_return_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any],
+) -> None:
+    signed_calls: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "services.openai_backend_api.requests.put",
+        lambda url, **kwargs: signed_calls.append((url, kwargs)),
+    )
+    backend, session = _backend([_FakeResponse(payload={
+        "file_id": "file-secret",
+        "upload_url": "https://upload.test/blob?sig=signed-secret",
+        **payload,
+    })])
+
+    with pytest.raises(UpstreamHTTPError) as captured:
+        backend.upload_chat_attachment_bytes(
+            b"%PDF-1.7",
+            "sample.pdf",
+            "application/pdf",
+            "document",
+        )
+
+    assert captured.value.status_code == 502
+    assert signed_calls == []
+    assert [method for method, _url, _kwargs in session.calls] == ["post"]
+    assert "file-secret" not in str(captured.value)
+    assert "signed-secret" not in str(captured.value)
+
+
+@pytest.mark.parametrize("payload", [{"status": "failed"}, {"success": False}])
+def test_unsuccessful_confirmation_response_does_not_return_pointer(
+    signed_upload: _SignedUploadTransport,
+    payload: dict[str, Any],
+) -> None:
+    backend, session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload=payload),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    with pytest.raises(UpstreamHTTPError) as captured:
+        backend.upload_chat_attachment_bytes(
+            b"%PDF-1.7",
+            "sample.pdf",
+            "application/pdf",
+            "document",
+        )
+
+    assert captured.value.status_code == 502
+    assert [method for method, _url, _kwargs in session.calls] == ["post", "post"]
     assert "file-secret" not in str(captured.value)
     assert "signed-secret" not in str(captured.value)
 
@@ -325,12 +532,16 @@ def test_confirmed_attachment_auth_failure_maps_to_invalid_token_without_secrets
     assert "test-token" not in message
 
 
-def test_signed_upload_network_error_is_sanitized() -> None:
-    backend, _session = _backend([])
-    backend.session = _PutFailureSession([_FakeResponse(payload={
+def test_signed_upload_network_error_is_sanitized(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, _session = _backend([_FakeResponse(payload={
         "file_id": "file-secret",
         "upload_url": "https://upload.test/blob?sig=signed-secret",
     })])
+    signed_upload.error = RuntimeError(
+        "signed upload failed for https://upload.test/blob?sig=signed-secret"
+    )
 
     with pytest.raises(RuntimeError) as captured:
         backend.upload_chat_attachment_bytes(

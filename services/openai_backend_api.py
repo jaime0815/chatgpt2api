@@ -98,6 +98,24 @@ CODEX_RESPONSES_INSTRUCTIONS = (
     "Use the image_generation tool to create exactly one image for the user's request. "
     "Return the generated image result."
 )
+CHAT_ATTACHMENT_FAILURE_STATES = {
+    "aborted",
+    "blocked",
+    "canceled",
+    "cancelled",
+    "error",
+    "failed",
+    "failure",
+    "rejected",
+}
+CHAT_ATTACHMENT_PROCESSING_SUCCESS_STATES = {
+    "complete",
+    "completed",
+    "finished",
+    "finished_successfully",
+    "success",
+    "succeeded",
+}
 
 # 内容政策违规错误关键词（上游拒绝生成图片的各种表述）
 _CONTENT_POLICY_KEYWORDS = (
@@ -1159,9 +1177,10 @@ class OpenAIBackendAPI:
         # file identifiers, or account-specific diagnostics.
         raise UpstreamHTTPError(context, status_code or 502, {"detail": "upstream attachment request failed"})
 
-    def _chat_attachment_blob_headers(self, mime_type: str) -> Dict[str, str]:
+    def _chat_attachment_blob_headers(self, mime_type: str, file_size: int) -> Dict[str, str]:
         return {
             "Content-Type": mime_type,
+            "Content-Length": str(file_size),
             "x-ms-blob-type": "BlockBlob",
             "x-ms-version": "2020-04-08",
             "Origin": self.base_url,
@@ -1170,6 +1189,51 @@ class OpenAIBackendAPI:
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.8",
         }
+
+    def _chat_attachment_signed_upload_kwargs(self) -> Dict[str, Any]:
+        """Keep proxy/TLS settings while never reusing account credentials."""
+        session_kwargs = dict(getattr(self, "_session_kwargs", {}) or {})
+        for key in tuple(session_kwargs):
+            if str(key).lower() in {"auth", "authorization", "cookie", "cookies", "headers"}:
+                session_kwargs.pop(key, None)
+        return session_kwargs
+
+    @staticmethod
+    def _chat_attachment_semantics_ok(payload: Dict[str, Any], context: str) -> None:
+        status = str(payload.get("status") or "").strip().lower()
+        if payload.get("success") is False or status in CHAT_ATTACHMENT_FAILURE_STATES:
+            raise UpstreamHTTPError(
+                context,
+                502,
+                {"detail": "upstream attachment response was unsuccessful"},
+            )
+
+    @staticmethod
+    def _chat_attachment_processing_failed(event: Dict[str, Any]) -> bool:
+        pending: list[Any] = [event]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, list):
+                pending.extend(value)
+                continue
+            if not isinstance(value, dict):
+                continue
+            status = str(value.get("status") or "").strip().lower()
+            state = str(value.get("state") or "").strip().lower()
+            event_name = str(value.get("event") or "").strip().lower()
+            if (
+                value.get("success") is False
+                or status in CHAT_ATTACHMENT_FAILURE_STATES
+                or state in CHAT_ATTACHMENT_FAILURE_STATES
+                or event_name.endswith(".failed")
+                or event_name.endswith(".error")
+            ):
+                return True
+            error = value.get("error")
+            if error not in (None, "", {}, []):
+                return True
+            pending.extend(value.values())
+        return False
 
     @staticmethod
     def _chat_attachment_request(context: str, request: Callable[[], Any]) -> Any:
@@ -1206,6 +1270,7 @@ class OpenAIBackendAPI:
             )
             completed = False
             done = False
+            failed = False
             for payload in iter_sse_payloads(response):
                 if payload == "[DONE]":
                     done = True
@@ -1216,13 +1281,17 @@ class OpenAIBackendAPI:
                     continue
                 if not isinstance(event, dict):
                     continue
+                if self._chat_attachment_processing_failed(event):
+                    failed = True
+                    break
                 event_name = str(event.get("event") or "")
                 status = str(event.get("status") or "").lower()
-                if event_name == "file.processing.completed" and status in {"success", "completed", "succeeded"}:
+                if (
+                    event_name == "file.processing.completed"
+                    and status in CHAT_ATTACHMENT_PROCESSING_SUCCESS_STATES
+                ):
                     completed = True
-                if status in {"error", "failed", "failure"} or event_name.endswith(".failed"):
-                    break
-            if not completed or not done:
+            if failed or not completed or not done:
                 raise UpstreamHTTPError(
                     "chat attachment processing",
                     502,
@@ -1286,6 +1355,7 @@ class OpenAIBackendAPI:
             raise RuntimeError("invalid chat attachment creation response") from None
         if not isinstance(create_payload, dict):
             raise RuntimeError("invalid chat attachment creation response")
+        self._chat_attachment_semantics_ok(create_payload, "chat attachment creation")
         file_id = str(create_payload.get("file_id") or "")
         upload_url = str(create_payload.get("upload_url") or "")
         if not file_id or not upload_url:
@@ -1293,11 +1363,13 @@ class OpenAIBackendAPI:
 
         response = self._chat_attachment_request(
             "chat attachment upload",
-            lambda: self.session.put(
+            lambda: requests.put(
                 upload_url,
-                headers=self._chat_attachment_blob_headers(mime_type),
+                headers=self._chat_attachment_blob_headers(mime_type, len(data)),
                 data=data,
                 timeout=120,
+                discard_cookies=True,
+                **self._chat_attachment_signed_upload_kwargs(),
             ),
         )
         self._chat_attachment_response_ok(
@@ -1321,6 +1393,15 @@ class OpenAIBackendAPI:
             context="chat attachment confirmation",
             authenticated_request=True,
         )
+        try:
+            confirmation_payload = response.json()
+        except Exception:
+            confirmation_payload = None
+        if isinstance(confirmation_payload, dict):
+            self._chat_attachment_semantics_ok(
+                confirmation_payload,
+                "chat attachment confirmation",
+            )
 
         if kind == "document":
             self._process_chat_attachment_document(file_id, file_name)
