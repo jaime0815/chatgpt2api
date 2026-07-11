@@ -104,6 +104,18 @@ def test_remote_execution_transmits_safe_update_and_cleanup_steps(tmp_path: Path
     assert 'git fetch --no-tags "$bundle_path" "$bundle_source_ref:$bundle_ref"' in payload
     assert 'git merge --ff-only "$bundle_ref"' in payload
     assert payload.index("docker compose version") < payload.index("command -v docker-compose")
+    v2_start = payload.index("v2)")
+    v2_end = payload.index(";;", v2_start)
+    v2_image_discovery = payload[v2_start:v2_end]
+    v1_start = payload.index("v1)")
+    v1_end = payload.index(";;", v1_start)
+    v1_image_discovery = payload[v1_start:v1_end]
+    assert 'compose -f "$compose_file" config --images' in v2_image_discovery
+    assert 'compose -f "$compose_file" config --images' not in v1_image_discovery
+    assert 'compose -f "$compose_file" config' in v1_image_discovery
+    assert 'compose -f "$compose_file" images -q' in v1_image_discovery
+    assert "image:" in v1_image_discovery
+    assert 'add_image_ref "chatgpt2api:local"' in v1_image_discovery
     assert '"$deploy_path/scripts/docker-up.sh" --local --build' in payload
     assert "seed_host_mounts()" in payload
     assert 'compose -f "$compose_file" build --pull' in payload

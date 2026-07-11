@@ -159,10 +159,12 @@ require_remote_command base64
 require_remote_command grep
 
 if docker compose version >/dev/null 2>&1; then
+  compose_impl="v2"
   compose() {
     docker compose "$@"
   }
 elif command -v docker-compose >/dev/null 2>&1; then
+  compose_impl="v1"
   compose() {
     docker-compose "$@"
   }
@@ -182,6 +184,71 @@ seed_host_mounts() {
   if [[ -d "$deploy_path/data" && -z "$(find "$host_data_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
     cp -a "$deploy_path/data"/. "$host_data_dir"/
   fi
+}
+
+declare -a image_refs=()
+declare -A image_refs_seen=()
+declare -A old_image_ids=()
+declare -A current_image_ids=()
+
+add_image_ref() {
+  local image_ref="$1"
+
+  [[ -n "$image_ref" ]] || return
+  if [[ -n "${image_refs_seen[$image_ref]:-}" ]]; then
+    return
+  fi
+  image_refs_seen["$image_ref"]=1
+  image_refs+=("$image_ref")
+}
+
+discover_image_refs() {
+  local compose_images image_id image_ref
+
+  case "$compose_impl" in
+    v2)
+      compose_images="$(compose -f "$compose_file" config --images)"
+      while IFS= read -r image_ref; do
+        add_image_ref "$image_ref"
+      done <<<"$compose_images"
+      ;;
+    v1)
+      compose_images="$(
+        compose -f "$compose_file" config |
+          awk '
+            /^[[:space:]]*image:[[:space:]]*/ {
+              image = $0
+              sub(/^[[:space:]]*image:[[:space:]]*/, "", image)
+              sub(/[[:space:]]+#.*$/, "", image)
+              first = substr(image, 1, 1)
+              last = substr(image, length(image), 1)
+              quote = sprintf("%c", 34)
+              squote = sprintf("%c", 39)
+              if ((first == quote || first == squote) && last == first) {
+                image = substr(image, 2, length(image) - 2)
+              }
+              if (image ~ /^[^[:space:]]+$/) print image
+            }
+          '
+      )"
+      while IFS= read -r image_ref; do
+        add_image_ref "$image_ref"
+      done <<<"$compose_images"
+      if [[ "$compose_file" == "$deploy_path/docker-compose.local.yml" ]]; then
+        add_image_ref "chatgpt2api:local"
+      fi
+      while IFS= read -r image_id; do
+        [[ -n "$image_id" ]] || continue
+        old_image_ids["$image_id"]=1
+        while IFS= read -r image_ref; do
+          add_image_ref "$image_ref"
+        done < <(docker image inspect --format '{{range .RepoTags}}{{println .}}{{end}}' "$image_id" 2>/dev/null || true)
+      done < <(compose -f "$compose_file" images -q 2>/dev/null | sort -u)
+      ;;
+    *)
+      fail "Unknown compose implementation: $compose_impl"
+      ;;
+  esac
 }
 
 [[ "$target_commit" =~ ^[0-9a-f]{40,64}$ ]] || fail "Invalid bundled commit identifier."
@@ -212,12 +279,9 @@ git merge-base --is-ancestor HEAD "$bundle_ref" || fail "Bundled commit is not a
 git merge --ff-only "$bundle_ref"
 [[ "$(git rev-parse HEAD)" == "$target_commit" ]] || fail "Remote main did not reach the requested bundled commit."
 
-compose_images="$(compose -f "$compose_file" config --images)"
-mapfile -t image_refs < <(printf '%s\n' "$compose_images" | sed '/^[[:space:]]*$/d' | sort -u)
+discover_image_refs
 (( ${#image_refs[@]} > 0 )) || fail "No service image was found in $compose_file."
 
-declare -A old_image_ids=()
-declare -A current_image_ids=()
 for image_ref in "${image_refs[@]}"; do
   if old_image_id="$(docker image inspect --format '{{.Id}}' "$image_ref" 2>/dev/null)"; then
     old_image_ids["$old_image_id"]=1
