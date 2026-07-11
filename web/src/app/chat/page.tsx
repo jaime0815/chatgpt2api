@@ -27,8 +27,6 @@ import { useAuthGuard } from "@/lib/use-auth-guard"
 import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth"
 import { getChatAttachments } from "@/store/chat-conversations"
 
-const TEXT_ATTACHMENT_UNAVAILABLE = "当前版本暂不支持带附件的普通聊天，请移除附件后发送。"
-
 type PreviewAttachment = ChatComposerAttachment
 
 type LightboxImage = {
@@ -133,6 +131,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   const [chatModels, setChatModels] = useState<string[]>(["auto"])
   const [imageModels, setImageModels] = useState<string[]>(["gpt-image-2"])
   const [modelsLoaded, setModelsLoaded] = useState(false)
+  const [isRefreshingModels, setIsRefreshingModels] = useState(false)
   const [isImageSubmitPending, setIsImageSubmitPending] = useState(false)
   const [lightboxImages, setLightboxImages] = useState<LightboxImage[]>([])
   const [lightboxIndex, setLightboxIndex] = useState(0)
@@ -143,6 +142,8 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   const imageMessageAttachmentIdsRef = useRef(new Map<string, readonly string[]>())
   const discardedImageMessageIdsRef = useRef(new Set<string>())
   const imageSubmitInFlightRef = useRef(false)
+  const modelCatalogLoadedRef = useRef(false)
+  const modelRequestIdRef = useRef(0)
 
   const activeConversation = controller.activeConversation
   const activeAttachmentKey = useMemo(
@@ -312,40 +313,67 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
     saveChatImageSettings(session.subjectId, imageSettings)
   }, [imageSettings, session.subjectId])
 
-  useEffect(() => {
-    let cancelled = false
-    void fetchModels().then(
-      (response) => {
-        if (cancelled) {
-          return
-        }
-        const models = Array.isArray(response.data) ? response.data : []
-        setChatModels(filterChatModels(models))
-        const imageModelIds = [
-          ...new Set(
-            models
-              .map((model) => String(model.id || "").trim())
-              .filter((model) => model.toLowerCase().includes("image")),
-          ),
-        ]
-        setImageModels(imageModelIds.length > 0 ? imageModelIds : ["gpt-image-2"])
-        setImageSettings((current) =>
-          imageModelIds.includes(current.model)
-            ? current
-            : normalizeImageSettings({ ...current, model: imageModelIds[0] || "gpt-image-2" }),
-        )
+  const loadModels = useCallback(async (refresh = false) => {
+    const requestId = modelRequestIdRef.current + 1
+    modelRequestIdRef.current = requestId
+    if (refresh) {
+      setIsRefreshingModels(true)
+    }
+
+    try {
+      const response = refresh ? await fetchModels({ refresh: true }) : await fetchModels()
+      if (requestId !== modelRequestIdRef.current) {
+        return
+      }
+      const models = Array.isArray(response.data) ? response.data : []
+      const nextChatModels = filterChatModels(models)
+      const nextImageModels = [
+        ...new Set(
+          models
+            .map((model) => String(model.id || "").trim())
+            .filter((model) => model.toLowerCase().includes("image")),
+        ),
+      ]
+      const availableImageModels = nextImageModels.length > 0 ? nextImageModels : ["gpt-image-2"]
+
+      modelCatalogLoadedRef.current = true
+      setChatModels(nextChatModels)
+      setImageModels(availableImageModels)
+      setImageSettings((current) =>
+        availableImageModels.includes(current.model)
+          ? current
+          : normalizeImageSettings({ ...current, model: availableImageModels[0] }),
+      )
+      setModelsLoaded(true)
+    } catch (error) {
+      if (requestId !== modelRequestIdRef.current) {
+        return
+      }
+      if (!modelCatalogLoadedRef.current) {
+        setChatModels(["auto"])
+        setImageModels(["gpt-image-2"])
         setModelsLoaded(true)
-      },
-      () => {
-        if (cancelled) {
-          return
-        }
-      },
-    )
-    return () => {
-      cancelled = true
+      }
+      if (refresh) {
+        toast.error(error instanceof Error ? error.message : "刷新模型失败")
+      }
+    } finally {
+      if (requestId === modelRequestIdRef.current && refresh) {
+        setIsRefreshingModels(false)
+      }
     }
   }, [])
+
+  useEffect(() => {
+    void loadModels()
+  }, [loadModels])
+
+  useEffect(
+    () => () => {
+      modelRequestIdRef.current += 1
+    },
+    [],
+  )
 
   useEffect(() => {
     if (!modelsLoaded || controller.state.isLoading) {
@@ -461,14 +489,26 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
     const submittedInput = input
     const prompt = submittedInput.trim()
     if (mode === "chat") {
-      if (draftAttachmentsRef.current.length > 0) {
-        setAttachmentError(TEXT_ATTACHMENT_UNAVAILABLE)
-        return
-      }
+      const submittedAttachments = draftAttachmentsRef.current
       try {
-        const stream = controller.sendText({ text: prompt })
+        const stream = controller.sendText(
+          submittedAttachments.length > 0
+            ? { text: prompt, attachments: submittedAttachments }
+            : { text: prompt },
+        )
         setInput((current) => (current === submittedInput ? "" : current))
         await stream
+        const submittedAttachmentIds = new Set(
+          submittedAttachments.map((attachment) => attachment.id),
+        )
+        const retainedAttachments = draftAttachmentsRef.current.filter(
+          (attachment) => !submittedAttachmentIds.has(attachment.id),
+        )
+        draftAttachmentsRef.current
+          .filter((attachment) => submittedAttachmentIds.has(attachment.id))
+          .forEach(revokePreview)
+        updateDraftAttachments(retainedAttachments)
+        setAttachmentError(null)
       } catch (error) {
         setInput((current) => current || submittedInput)
         toast.error(error instanceof Error ? error.message : "发送消息失败")
@@ -532,9 +572,6 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       messageId: string,
       inputValue: { text: string; attachmentIds: string[]; files: File[] },
     ) => {
-      if (inputValue.attachmentIds.length > 0 || inputValue.files.length > 0) {
-        throw new Error(TEXT_ATTACHMENT_UNAVAILABLE)
-      }
       if (controller.isStreaming) {
         throw new Error("当前已有回复正在生成")
       }
@@ -543,6 +580,13 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       if (!conversation || !message || message.role !== "user") {
         throw new Error("没有找到要编辑的用户消息")
       }
+      const attachments = inputValue.files.length
+        ? await prepareChatAttachments(inputValue.files, { mode: "chat" })
+        : []
+      const retainedAttachments = savedAttachments.filter((attachment) =>
+        inputValue.attachmentIds.includes(attachment.id),
+      )
+      validateChatAttachments([...retainedAttachments, ...attachments], { mode: "chat" })
       const messageIndex = conversation.messages.findIndex((item) => item.id === messageId)
       const firstRemovedIndex = messageIndex + 1
       discardTrackedImageMessages(
@@ -552,9 +596,24 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
           new Set(conversation.messages.map((item) => item.id)),
         ),
       )
-      await controller.editAndResend(messageId, { text: inputValue.text, attachmentIds: [] })
+      await controller.editAndResend(
+        messageId,
+        attachments.length > 0
+          ? {
+              text: inputValue.text,
+              attachmentIds: inputValue.attachmentIds,
+              attachments,
+            }
+          : { text: inputValue.text, attachmentIds: inputValue.attachmentIds },
+      )
     },
-    [activeConversation?.messages, controller, discardTrackedImageMessages, ownerMessageIdsForConversation],
+    [
+      activeConversation,
+      controller,
+      discardTrackedImageMessages,
+      ownerMessageIdsForConversation,
+      savedAttachments,
+    ],
   )
 
   const handleRetryAssistant = useCallback(
@@ -710,8 +769,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
     await controller.clearHistory()
   }, [controller, discardTrackedImageMessages])
 
-  const attachmentWarning =
-    attachmentError || (mode === "chat" && draftAttachments.length > 0 ? TEXT_ATTACHMENT_UNAVAILABLE : null)
+  const attachmentWarning = attachmentError
   const threadAttachments = activeAttachmentIds.length > 0 ? savedAttachments : []
 
   if (controller.state.isLoading) {
@@ -759,12 +817,16 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
         header={
           <ChatHeader
             models={displayedChatModels}
-            selectedModel={modelsLoaded ? controller.state.selectedModel : modelResolution.selected}
+            selectedModel={modelResolution.selected}
             unavailableModel={modelsLoaded ? modelResolution.unavailable : null}
             conversationTitle={activeConversation?.title}
             modelDisabled={controller.state.isLoading || !modelsLoaded}
+            isRefreshingModels={isRefreshingModels}
             onModelChange={(model) => {
               void controller.setSelectedModel(model)
+            }}
+            onRefreshModels={() => {
+              void loadModels(true)
             }}
             onOpenSidebar={() => setMobileSidebarOpen(true)}
             onNewConversation={() => void controller.createConversation()}
@@ -789,7 +851,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
             conversationId={activeConversation?.id || null}
             messages={activeConversation?.messages || []}
             attachments={threadAttachments}
-            allowAttachmentEdits={false}
+            allowAttachmentEdits={true}
             initialScrollTop={activeConversation?.scrollTop || 0}
             onScrollTopChange={(scrollTop) => {
               if (activeConversation) {

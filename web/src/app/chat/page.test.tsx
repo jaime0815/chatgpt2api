@@ -118,6 +118,8 @@ vi.mock("./components/chat-header", () => ({
     modelDisabled,
     onModelChange,
     onNewConversation,
+    onRefreshModels,
+    isRefreshingModels,
   }: {
     models: string[]
     selectedModel: string
@@ -125,8 +127,17 @@ vi.mock("./components/chat-header", () => ({
     modelDisabled?: boolean
     onModelChange: (model: string) => void
     onNewConversation: () => void
+    onRefreshModels?: () => void
+    isRefreshingModels?: boolean
   }) => {
-    mocks.headerOptions = { models, selectedModel, unavailableModel, modelDisabled }
+    mocks.headerOptions = {
+      models,
+      selectedModel,
+      unavailableModel,
+      modelDisabled,
+      onRefreshModels,
+      isRefreshingModels,
+    }
     return (
       <header>
         <output data-testid="header-selected-model">{selectedModel}</output>
@@ -134,6 +145,14 @@ vi.mock("./components/chat-header", () => ({
         <output data-testid="header-model-disabled">{String(Boolean(modelDisabled))}</output>
         <button type="button" onClick={() => onModelChange("gpt-5.2")}>选择模型</button>
         <button type="button" onClick={onNewConversation}>新对话</button>
+        <button
+          type="button"
+          aria-label="刷新模型"
+          disabled={Boolean(isRefreshingModels)}
+          onClick={onRefreshModels}
+        >
+          刷新模型
+        </button>
       </header>
     )
   },
@@ -173,6 +192,7 @@ vi.mock("./components/chat-composer", () => ({
     onRemoveAttachment,
     attachmentError,
     imageSettings,
+    imageModels,
     value,
     disabled,
   }: {
@@ -187,6 +207,7 @@ vi.mock("./components/chat-composer", () => ({
     onRemoveAttachment: (attachmentId: string) => void
     attachmentError?: string | null
     imageSettings: { width: string; height: string; ratio: string; tier: string; count: string }
+    imageModels?: string[]
   }) => {
     mocks.composerOptions = {
       onValueChange,
@@ -206,6 +227,7 @@ vi.mock("./components/chat-composer", () => ({
       <output data-testid="image-settings">
         {imageSettings.width}x{imageSettings.height} {imageSettings.ratio}/{imageSettings.tier} {imageSettings.count}
       </output>
+      <output data-testid="image-models">{imageModels?.join(",")}</output>
       <button type="button" onClick={() => onValueChange("hello")}>输入消息</button>
       <button type="button" onClick={onSubmit}>提交</button>
       <button type="button" onClick={onStop}>停止</button>
@@ -601,7 +623,7 @@ describe("ChatPage", () => {
     await waitFor(() => expect(hydratedController.setSelectedModel).not.toHaveBeenCalled())
   })
 
-  it("keeps a hydrated chat model when the model catalog cannot be loaded", async () => {
+  it("falls back to automatic selection when the initial model catalog cannot be loaded", async () => {
     const hydratedController = controller()
     hydratedController.state.selectedModel = "gpt-5.2"
     mocks.controller = hydratedController
@@ -616,10 +638,10 @@ describe("ChatPage", () => {
       await Promise.resolve()
       await Promise.resolve()
     })
-    expect(hydratedController.setSelectedModel).not.toHaveBeenCalled()
+    await waitFor(() => expect(hydratedController.setSelectedModel).toHaveBeenCalledWith("auto"))
   })
 
-  it("keeps a hydrated model visible without an unavailable fallback when the catalog fails", async () => {
+  it("keeps only the automatic fallback visible when the initial catalog fails", async () => {
     const hydratedController = controller()
     hydratedController.state.selectedModel = "gpt-5.2"
     mocks.controller = hydratedController
@@ -633,14 +655,44 @@ describe("ChatPage", () => {
       await Promise.resolve()
     })
 
+    await waitFor(() => expect(hydratedController.setSelectedModel).toHaveBeenCalledWith("auto"))
     expect(mocks.headerOptions).toMatchObject({
-      models: ["auto", "gpt-5.2"],
-      selectedModel: "gpt-5.2",
-      unavailableModel: null,
-      modelDisabled: true,
+      models: ["auto"],
+      modelDisabled: false,
     })
-    expect(screen.getByTestId("header-selected-model")).toHaveTextContent("gpt-5.2")
-    expect(screen.getByTestId("header-unavailable-model")).toBeEmptyDOMElement()
+  })
+
+  it("keeps the last successful model catalog when a manual refresh fails", async () => {
+    const catalogController = controller()
+    catalogController.state.selectedModel = "gpt-5.5"
+    mocks.controller = catalogController
+    mocks.fetchModels.mockReset()
+    mocks.fetchModels
+      .mockResolvedValueOnce({ data: [{ id: "gpt-5.5" }, { id: "gpt-image-2" }] })
+      .mockRejectedValueOnce(new Error("catalog unavailable"))
+
+    render(<ChatPage />)
+
+    await waitFor(() =>
+      expect(mocks.headerOptions).toMatchObject({
+        models: ["auto", "gpt-5.5"],
+        selectedModel: "gpt-5.5",
+      }),
+    )
+    expect(screen.getByTestId("image-models")).toHaveTextContent("gpt-image-2")
+
+    fireEvent.click(screen.getByRole("button", { name: "刷新模型" }))
+
+    await waitFor(() => expect(mocks.fetchModels).toHaveBeenLastCalledWith({ refresh: true }))
+    await waitFor(() =>
+      expect(mocks.headerOptions).toMatchObject({
+        models: ["auto", "gpt-5.5"],
+        selectedModel: "gpt-5.5",
+        isRefreshingModels: false,
+      }),
+    )
+    expect(screen.getByTestId("image-models")).toHaveTextContent("gpt-image-2")
+    expect(screen.getByRole("button", { name: "刷新模型" })).toBeEnabled()
   })
 
   it("submits one image task while an earlier submit is still pending and releases the guard after failure", async () => {
@@ -846,6 +898,47 @@ describe("ChatPage", () => {
       })
     })
     expect(branch.controller.upsertMessage).not.toHaveBeenCalled()
+  })
+
+  it("prepares retained and new attachments before resending an edited chat message", async () => {
+    const branch = controllerWithBranch()
+    const newDocument = {
+      id: "edited-document",
+      name: "edited.docx",
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      size: 8,
+      sha256: "d".repeat(64),
+      kind: "document" as const,
+      blob: new Blob(["docx"], {
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      }),
+    }
+    mocks.controller = branch.controller
+    mocks.prepareChatAttachments.mockResolvedValue([newDocument])
+    render(<ChatPage />)
+
+    const thread = mocks.threadOptions as {
+      onEditAndResend: (
+        messageId: string,
+        input: { text: string; attachmentIds: string[]; files: File[] },
+      ) => Promise<void>
+    }
+    await act(async () => {
+      await thread.onEditAndResend("user-anchor", {
+        text: "edited with files",
+        attachmentIds: ["retained-document"],
+        files: [new File(["docx"], "edited.docx", {
+          type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        })],
+      })
+    })
+
+    expect(mocks.prepareChatAttachments).toHaveBeenCalledWith(expect.any(Array), { mode: "chat" })
+    expect(branch.controller.editAndResend).toHaveBeenCalledWith("user-anchor", {
+      text: "edited with files",
+      attachmentIds: ["retained-document"],
+      attachments: [newDocument],
+    })
   })
 
   it("keeps branch image tasks when an edit cannot start because text is streaming", async () => {
@@ -1107,17 +1200,26 @@ describe("ChatPage", () => {
     expect(screen.getByTestId("image-settings")).toHaveTextContent("2560x1440 16:9/2k 12")
   })
 
-  it("blocks ordinary chat attachments while preserving image-reference preparation and retry resolution", async () => {
-    const reference = {
-      id: "reference-attachment",
+  it("sends ordinary chat attachments while preserving image-reference preparation and retry resolution", async () => {
+    const documentAttachment = {
+      id: "document-attachment",
+      name: "summary.pdf",
+      mimeType: "application/pdf",
+      size: 5,
+      sha256: "a".repeat(64),
+      kind: "document" as const,
+      blob: new Blob(["pdf"], { type: "application/pdf" }),
+    }
+    const imageReference = {
+      id: "image-reference",
       name: "reference.png",
       mimeType: "image/png",
       size: 5,
-      sha256: "a".repeat(64),
+      sha256: "b".repeat(64),
       kind: "image" as const,
       blob: new Blob(["image"], { type: "image/png" }),
     }
-    mocks.prepareChatAttachments.mockResolvedValue([reference])
+    mocks.prepareChatAttachments.mockResolvedValueOnce([documentAttachment]).mockResolvedValueOnce([imageReference])
     mocks.chatImageUrlToFile.mockResolvedValue(
       new File(["image"], "reference-image.png", { type: "image/png" }),
     )
@@ -1127,20 +1229,22 @@ describe("ChatPage", () => {
     const imageOptions = mocks.imageOptions as {
       resolveAttachments: (attachmentIds: readonly string[]) => Promise<unknown>
     }
-    await imageOptions.resolveAttachments([reference.id])
+    await imageOptions.resolveAttachments([documentAttachment.id])
     expect((mocks.controller as ReturnType<typeof controller>).resolveAttachments).toHaveBeenCalledWith([
-      reference.id,
+      documentAttachment.id,
     ])
 
     fireEvent.click(screen.getByRole("button", { name: "添加附件" }))
-    await waitFor(() =>
-      expect(screen.getByTestId("attachment-error")).toHaveTextContent(
-        "当前版本暂不支持带附件的普通聊天",
-      ),
-    )
+    await waitFor(() => expect(mocks.prepareChatAttachments).toHaveBeenCalledWith(expect.any(Array), { mode: "chat" }))
     fireEvent.click(screen.getByRole("button", { name: "输入消息" }))
     fireEvent.click(screen.getByRole("button", { name: "提交" }))
-    expect((mocks.controller as ReturnType<typeof controller>).sendText).not.toHaveBeenCalled()
+    await waitFor(() =>
+      expect((mocks.controller as ReturnType<typeof controller>).sendText).toHaveBeenCalledWith({
+        text: "hello",
+        attachments: [documentAttachment],
+      }),
+    )
+    expect(screen.getByTestId("attachment-error")).toBeEmptyDOMElement()
 
     fireEvent.click(screen.getByRole("button", { name: "用作参考图" }))
     await waitFor(() => expect(mocks.chatImageUrlToFile).toHaveBeenCalledWith(

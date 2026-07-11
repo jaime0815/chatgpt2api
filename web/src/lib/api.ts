@@ -338,7 +338,16 @@ export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
 }
 
-export async function fetchModels() {
+export type FetchModelsOptions = {
+  refresh?: boolean;
+};
+
+export async function fetchModels(options: FetchModelsOptions = {}) {
+  if (options.refresh) {
+    return httpRequest<ModelListResponse>("/v1/models?refresh=1", {
+      headers: {"Cache-Control": "no-store"},
+    });
+  }
   return httpRequest<ModelListResponse>("/v1/models");
 }
 

@@ -64,6 +64,7 @@ describe("ChatHeader", () => {
     const onNewConversation = vi.fn()
     const onRenameConversation = vi.fn()
     const onDeleteConversation = vi.fn()
+    const onRefreshModels = vi.fn()
 
     render(
       <ChatHeader
@@ -73,6 +74,7 @@ describe("ChatHeader", () => {
         onModelChange={vi.fn()}
         onOpenSidebar={onOpenSidebar}
         onNewConversation={onNewConversation}
+        onRefreshModels={onRefreshModels}
         onRenameConversation={onRenameConversation}
         onDeleteConversation={onDeleteConversation}
       />,
@@ -84,11 +86,13 @@ describe("ChatHeader", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "打开聊天历史" }))
     fireEvent.click(screen.getByRole("button", { name: "新对话" }))
+    fireEvent.click(screen.getByRole("button", { name: "刷新模型" }))
     fireEvent.click(screen.getByRole("button", { name: "会话操作" }))
     fireEvent.click(screen.getByRole("button", { name: "重命名对话" }))
 
     expect(onOpenSidebar).toHaveBeenCalledOnce()
     expect(onNewConversation).toHaveBeenCalledOnce()
+    expect(onRefreshModels).toHaveBeenCalledOnce()
     expect(onRenameConversation).toHaveBeenCalledOnce()
 
     fireEvent.click(screen.getByRole("button", { name: "会话操作" }))

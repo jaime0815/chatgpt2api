@@ -1,6 +1,6 @@
 "use client"
 
-import { Menu, MoreHorizontal, Pencil, SquarePen, Trash2 } from "lucide-react"
+import { Menu, MoreHorizontal, Pencil, RefreshCw, SquarePen, Trash2 } from "lucide-react"
 import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
@@ -15,7 +15,9 @@ export type ChatHeaderProps = {
   unavailableModel?: string | null
   conversationTitle?: string | null
   modelDisabled?: boolean
+  isRefreshingModels?: boolean
   onModelChange: (model: string) => void
+  onRefreshModels?: () => void
   onOpenSidebar: () => void
   onNewConversation: () => void
   onRenameConversation?: () => void
@@ -28,7 +30,9 @@ export function ChatHeader({
   unavailableModel,
   conversationTitle,
   modelDisabled = false,
+  isRefreshingModels = false,
   onModelChange,
+  onRefreshModels,
   onOpenSidebar,
   onNewConversation,
   onRenameConversation,
@@ -53,7 +57,7 @@ export function ChatHeader({
           </Button>
         </ChatTooltip>
 
-        <div className="flex min-w-0 justify-center md:justify-start">
+        <div className="flex min-w-0 items-center justify-center gap-1 md:justify-start">
           <ChatModelSelect
             models={models}
             value={selectedModel}
@@ -61,6 +65,19 @@ export function ChatHeader({
             disabled={modelDisabled}
             onValueChange={onModelChange}
           />
+          <ChatTooltip label={isRefreshingModels ? "正在刷新模型" : "刷新模型"}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-8"
+              aria-label="刷新模型"
+              disabled={!onRefreshModels || isRefreshingModels}
+              onClick={onRefreshModels}
+            >
+              <RefreshCw className={isRefreshingModels ? "animate-spin" : undefined} />
+            </Button>
+          </ChatTooltip>
         </div>
 
         <div className="flex items-center justify-end gap-1">
