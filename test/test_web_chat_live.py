@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import httpx
 import pytest
+
+
+httpx = pytest.importorskip("httpx")
 
 
 _OPT_IN_ENV = "RUN_LIVE_CHAT_ATTACHMENTS"
@@ -183,18 +185,28 @@ def _image_fixtures(*, minimum: int) -> list[_Attachment]:
     return attachments
 
 
-def _request_payload(target: _LiveChatTarget, prompt: str, attachments: list[_Attachment]) -> dict[str, object]:
+def _request_payload(
+    target: _LiveChatTarget,
+    prompt: str,
+    attachments: list[_Attachment],
+    *,
+    prior_messages: list[dict[str, object]] | None = None,
+    attach_to_current_message: bool = True,
+) -> dict[str, object]:
     attachment_ids = [f"live-attachment-{index}" for index in range(1, len(attachments) + 1)]
+    current_attachment_ids = attachment_ids if attach_to_current_message else []
+    messages = [*(prior_messages or [])]
+    messages.append(
+        {
+            "id": f"live-message-{len(messages) + 1}",
+            "role": "user",
+            "text": prompt,
+            "attachment_ids": current_attachment_ids,
+        }
+    )
     return {
         "model": target.model,
-        "messages": [
-            {
-                "id": "live-message-1",
-                "role": "user",
-                "text": prompt,
-                "attachment_ids": attachment_ids,
-            }
-        ],
+        "messages": messages,
         "attachments": [
             {
                 "id": attachment_id,
@@ -214,6 +226,8 @@ def _post_stream(
     *,
     prompt: str,
     attachments: list[_Attachment] | None = None,
+    prior_messages: list[dict[str, object]] | None = None,
+    attach_to_current_message: bool = True,
 ) -> httpx.Response:
     attachment_list = attachments or []
     if sum(len(attachment.data) for attachment in attachment_list) > _MAX_MESSAGE_ATTACHMENT_BYTES:
@@ -223,7 +237,16 @@ def _post_stream(
             "request",
             (
                 None,
-                json.dumps(_request_payload(target, prompt, attachment_list), ensure_ascii=False),
+                json.dumps(
+                    _request_payload(
+                        target,
+                        prompt,
+                        attachment_list,
+                        prior_messages=prior_messages,
+                        attach_to_current_message=attach_to_current_message,
+                    ),
+                    ensure_ascii=False,
+                ),
                 "application/json",
             ),
         )
@@ -255,7 +278,7 @@ def _sse_events(body: str) -> list[_SseEvent]:
                 event = line.split(":", 1)[1].strip()
             elif line.startswith("data:"):
                 data_lines.append(line.split(":", 1)[1].lstrip())
-        if data_lines:
+        if data_lines or event == "error":
             events.append(_SseEvent(event=event, data="\n".join(data_lines)))
     return events
 
@@ -268,11 +291,14 @@ def _error_codes(events: list[_SseEvent]) -> set[str]:
         try:
             payload = json.loads(event.data)
         except json.JSONDecodeError:
+            codes.add("<malformed_error_event>")
             continue
         error = payload.get("error") if isinstance(payload, dict) else None
         code = error.get("code") if isinstance(error, dict) else None
         if isinstance(code, str) and code:
             codes.add(code)
+        else:
+            codes.add("<unstructured_error_event>")
     return codes
 
 
@@ -281,7 +307,7 @@ def _assert_completed_text_stream(response: httpx.Response) -> list[_SseEvent]:
     assert response.headers.get("content-type", "").startswith("text/event-stream")
     events = _sse_events(response.text)
     codes = _error_codes(events)
-    if codes & _UNUSABLE_ACCOUNT_CODES:
+    if codes and codes <= _UNUSABLE_ACCOUNT_CODES:
         pytest.skip("configured service has no usable local text account for this live smoke run")
     assert not codes, f"text stream emitted unexpected public errors: {sorted(codes)}"
     assert events and events[-1].data == "[DONE]", "text stream did not finish with [DONE]"
@@ -320,9 +346,9 @@ def _assert_native_attachment_stream_or_xfail(response: httpx.Response, label: s
     assert response.headers.get("content-type", "").startswith("text/event-stream")
     events = _sse_events(response.text)
     codes = _error_codes(events)
-    if codes & _UNUSABLE_ACCOUNT_CODES:
+    if codes and codes <= _UNUSABLE_ACCOUNT_CODES:
         pytest.skip("configured service lost its usable local text account during this live smoke run")
-    if _ATTACHMENT_UNAVAILABLE_CODE in codes:
+    if codes == {_ATTACHMENT_UNAVAILABLE_CODE}:
         pytest.xfail(
             "native attachment uploader is not wired into the default ChatStreamSession yet"
         )
@@ -357,6 +383,44 @@ def test_live_document_attachment_streams_when_uploader_is_available(
         attachments=[attachment],
     )
     _assert_native_attachment_stream_or_xfail(response, label)
+
+
+def test_live_pdf_follow_up_streams_when_uploader_is_available(
+    live_text_stream: list[_SseEvent],
+    live_target: _LiveChatTarget,
+) -> None:
+    assert live_text_stream[-1].data == "[DONE]"
+    pdf = _document_fixture(_PDF_ENV, ".pdf")
+    initial_prompt = "Briefly acknowledge the attached PDF before a follow-up question."
+    initial_response = _post_stream(
+        live_target,
+        prompt=initial_prompt,
+        attachments=[pdf],
+    )
+    _assert_native_attachment_stream_or_xfail(initial_response, "PDF attachment")
+
+    # The web endpoint is stateless: a follow-up replays the persisted history and attachment manifest.
+    follow_up = _post_stream(
+        live_target,
+        prompt="What file did I attach in the previous message?",
+        attachments=[pdf],
+        prior_messages=[
+            {
+                "id": "live-message-1",
+                "role": "user",
+                "text": initial_prompt,
+                "attachment_ids": ["live-attachment-1"],
+            },
+            {
+                "id": "live-assistant-1",
+                "role": "assistant",
+                "text": "Acknowledge the attached PDF.",
+                "attachment_ids": [],
+            },
+        ],
+        attach_to_current_message=False,
+    )
+    _assert_native_attachment_stream_or_xfail(follow_up, "PDF follow-up")
 
 
 def test_live_mixed_image_document_streams_when_uploader_is_available(
