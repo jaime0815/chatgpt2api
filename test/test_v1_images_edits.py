@@ -3,20 +3,15 @@ from __future__ import annotations
 import json
 import time
 import unittest
-from pathlib import Path
 
+import pytest
 import requests
 
+from test.live_compat_api import SKIP_REASON, enabled, load_image_fixtures, load_target
 from test.utils import save_image
 from utils.log import logger
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
-ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
-
-
-def load_asset_bytes(name: str) -> bytes:
-    return (ASSETS_DIR / name).read_bytes()
+pytestmark = pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
 
 
 def summarize_chunk(chunk: dict[str, object]) -> dict[str, object]:
@@ -36,19 +31,30 @@ def summarize_chunk(chunk: dict[str, object]) -> dict[str, object]:
 
 
 class ImageEditsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.target = load_target(require_image_model=True)
+        cls.image_fixtures = load_image_fixtures(minimum=2)
+
     def test_image_edit_http(self):
         """测试图片编辑的非流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/images/edits",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/images/edits"),
+            headers=self.target.headers(),
             data={
-                "model": "gpt-image-2",
+                "model": self.target.image_model,
                 "prompt": "参考输入图片，保持人物主体和二次元插画风格不变，让女孩怀里抱着一只可爱的小猫，画面自然协调。",
                 "n": "1",
                 "response_format": "b64_json",
             },
-            files={"image": ("chery_studio.png", load_asset_bytes("chery_studio.png"), "image/png")},
-            timeout=300,
+            files={
+                "image": (
+                    self.image_fixtures[0].name,
+                    self.image_fixtures[0].data,
+                    self.image_fixtures[0].mime_type,
+                )
+            },
+            timeout=self.target.timeout_seconds,
         )
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
@@ -69,21 +75,21 @@ class ImageEditsTests(unittest.TestCase):
     def test_image_edit_stream_http(self):
         """测试图片编辑的流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/images/edits",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/images/edits"),
+            headers=self.target.headers(),
             data={
-                "model": "gpt-image-2",
+                "model": self.target.image_model,
                 "prompt": "请提取两张输入界面截图中的 6 个任务，并把这 6 个任务整合排版到同一张图里，做成一张清晰的中文任务总览海报，标题明确，六个任务分区展示，版面整洁。",
                 "n": "1",
                 "response_format": "b64_json",
                 "stream": "true",
             },
             files=[
-                ("image", ("image.png", load_asset_bytes("image.png"), "image/png")),
-                ("image", ("image_edit.png", load_asset_bytes("image_edit.png"), "image/png")),
+                ("image", (fixture.name, fixture.data, fixture.mime_type))
+                for fixture in self.image_fixtures
             ],
             stream=True,
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         image_items: list[dict[str, object]] = []
         stream_errors: list[dict[str, object]] = []

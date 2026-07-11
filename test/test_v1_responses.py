@@ -4,18 +4,24 @@ import json
 import time
 import unittest
 
+import pytest
 import requests
 
+from test.live_compat_api import SKIP_REASON, enabled, load_target
 from test.utils import save_image
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
-TEXT_MODEL = "auto"
-IMAGE_MODEL = "gpt-image-2"
-CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+pytestmark = pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
 
 
 class ResponsesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.target = load_target(
+            require_text_model=True,
+            require_image_model=True,
+            require_codex_image_model=True,
+        )
+
     @staticmethod
     def _iter_sse_payloads(response: requests.Response):
         for line in response.iter_lines():
@@ -27,10 +33,10 @@ class ResponsesTests(unittest.TestCase):
     def test_text_response_http(self):
         """测试 Responses 文本的非流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/responses",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/responses"),
+            headers=self.target.headers(),
             json={
-                "model": TEXT_MODEL,
+                "model": self.target.text_model,
                 "input": [
                     {
                         "role": "user",
@@ -40,7 +46,7 @@ class ResponsesTests(unittest.TestCase):
                     }
                 ],
             },
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         self.assertEqual(response.status_code, 200, response.text)
         print("responses text non-stream status:")
@@ -59,10 +65,10 @@ class ResponsesTests(unittest.TestCase):
     def test_text_response_stream_http(self):
         """测试 Responses 文本的流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/responses",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/responses"),
+            headers=self.target.headers(),
             json={
-                "model": TEXT_MODEL,
+                "model": self.target.text_model,
                 "input": [
                     {
                         "role": "user",
@@ -74,7 +80,7 @@ class ResponsesTests(unittest.TestCase):
                 "stream": True,
             },
             stream=True,
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(
@@ -106,10 +112,10 @@ class ResponsesTests(unittest.TestCase):
     def test_image_response_http(self):
         """测试 Responses 画图的非流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/responses",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/responses"),
+            headers=self.target.headers(),
             json={
-                "model": IMAGE_MODEL,
+                "model": self.target.image_model,
                 "input": [
                     {
                         "role": "user",
@@ -120,7 +126,7 @@ class ResponsesTests(unittest.TestCase):
                 ],
                 "tools": [{"type": "image_generation"}],
             },
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         self.assertEqual(response.status_code, 200, response.text)
         saved_paths = []
@@ -145,10 +151,10 @@ class ResponsesTests(unittest.TestCase):
     def test_image_response_stream_http(self):
         """测试 Responses 画图的流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/responses",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/responses"),
+            headers=self.target.headers(),
             json={
-                "model": IMAGE_MODEL,
+                "model": self.target.image_model,
                 "input": [
                     {
                         "role": "user",
@@ -161,7 +167,7 @@ class ResponsesTests(unittest.TestCase):
                 "stream": True,
             },
             stream=True,
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(
@@ -199,10 +205,10 @@ class ResponsesTests(unittest.TestCase):
     def test_codex_image_response_http(self):
         """测试 Responses 的 codex 画图非流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/responses",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/responses"),
+            headers=self.target.headers(),
             json={
-                "model": CODEX_IMAGE_MODEL,
+                "model": self.target.codex_image_model,
                 "input": [
                     {
                         "role": "user",
@@ -213,7 +219,7 @@ class ResponsesTests(unittest.TestCase):
                 ],
                 "tools": [{"type": "image_generation"}],
             },
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         self.assertEqual(response.status_code, 200, response.text)
         saved_paths = []
@@ -238,10 +244,10 @@ class ResponsesTests(unittest.TestCase):
     def test_codex_image_response_stream_http(self):
         """测试 Responses 的 codex 画图流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/responses",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/responses"),
+            headers=self.target.headers(),
             json={
-                "model": CODEX_IMAGE_MODEL,
+                "model": self.target.codex_image_model,
                 "input": [
                     {
                         "role": "user",
@@ -254,7 +260,7 @@ class ResponsesTests(unittest.TestCase):
                 "stream": True,
             },
             stream=True,
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(

@@ -4,33 +4,39 @@ import json
 import time
 import unittest
 
+import pytest
 import requests
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
-MODEL = "auto"
+from test.live_compat_api import SKIP_REASON, enabled, load_target
+
+
+pytestmark = pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
 
 
 class AnthropicMessagesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.target = load_target(require_text_model=True)
+
     @staticmethod
-    def _headers() -> dict[str, str]:
+    def _headers(api_key: str) -> dict[str, str]:
         return {
-            "x-api-key": AUTH_KEY,
+            "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
         }
 
     def test_message_http(self):
         """测试 Anthropic Messages 的非流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/messages",
-            headers=self._headers(),
+            self.target.url("/v1/messages"),
+            headers=self._headers(self.target.api_key),
             json={
-                "model": MODEL,
+                "model": self.target.text_model,
                 "messages": [
                     {"role": "user", "content": "你好，请简单介绍一下你自己。"},
                 ],
             },
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         print("messages non-stream status:")
         print(response.status_code)
@@ -44,17 +50,17 @@ class AnthropicMessagesTests(unittest.TestCase):
         """测试 Anthropic Messages 的流式 HTTP 调用。"""
         started_at = time.time()
         response = requests.post(
-            f"{BASE_URL}/v1/messages",
-            headers=self._headers(),
+            self.target.url("/v1/messages"),
+            headers=self._headers(self.target.api_key),
             json={
-                "model": MODEL,
+                "model": self.target.text_model,
                 "stream": True,
                 "messages": [
                     {"role": "user", "content": "你好，请简单介绍一下你自己。"},
                 ],
             },
             stream=True,
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         headers_at = time.time()
         print("messages stream status:")

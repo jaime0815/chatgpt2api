@@ -4,27 +4,32 @@ import json
 import time
 import unittest
 
+import pytest
 import requests
 
+from test.live_compat_api import SKIP_REASON, enabled, load_target
 from test.utils import save_image
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
+pytestmark = pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
 
 
 class ImageGenerationsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.target = load_target(require_image_model=True)
+
     def test_image_generation_http(self):
         """测试图片生成的非流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/images/generations",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/images/generations"),
+            headers=self.target.headers(),
             json={
-                "model": "gpt-image-2",
+                "model": self.target.image_model,
                 "prompt": "我想做一张南京城市宣传海报图。",
                 "n": 1,
                 "response_format": "b64_json",
             },
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         payload = response.json()
         saved_paths = []
@@ -43,17 +48,17 @@ class ImageGenerationsTests(unittest.TestCase):
     def test_image_generation_stream_http(self):
         """测试图片生成的流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/images/generations",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/images/generations"),
+            headers=self.target.headers(),
             json={
-                "model": "gpt-image-2",
+                "model": self.target.image_model,
                 "prompt": "我想做一张南京城市宣传海报图。",
                 "n": 1,
                 "response_format": "b64_json",
                 "stream": True,
             },
             stream=True,
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         image_items: list[dict[str, object]] = []
         started_at = time.time()

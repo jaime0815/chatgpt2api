@@ -4,29 +4,34 @@ import json
 import time
 import unittest
 
+import pytest
 import requests
 
+from test.live_compat_api import SKIP_REASON, enabled, load_target
 from utils.helper import save_images_from_text
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
+pytestmark = pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
 
 
 class ChatCompletionsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.target = load_target(require_text_model=True, require_image_model=True)
+
     def test_text_completion_http(self):
         """测试文本对话的非流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/chat/completions"),
+            headers=self.target.headers(),
             json={
-                "model": "auto",
+                "model": self.target.text_model,
                 "messages": [
                     {"role": "user", "content": "你好。"},
                     {"role": "assistant", "content": "你好，我可以帮助你处理文本和图片相关请求。"},
                     {"role": "user", "content": "那你再简单介绍一下你自己。"},
                 ],
             },
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         print("text non-stream status:")
         print(response.status_code)
@@ -36,10 +41,10 @@ class ChatCompletionsTests(unittest.TestCase):
     def test_text_completion_stream_http(self):
         """测试文本对话的流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/chat/completions"),
+            headers=self.target.headers(),
             json={
-                "model": "auto",
+                "model": self.target.text_model,
                 "stream": True,
                 "messages": [
                     {"role": "user", "content": "你好。"},
@@ -48,7 +53,7 @@ class ChatCompletionsTests(unittest.TestCase):
                 ],
             },
             stream=True,
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         print("text stream status:")
         print(response.status_code)
@@ -60,16 +65,16 @@ class ChatCompletionsTests(unittest.TestCase):
     def test_image_completion_http(self):
         """测试图片对话的非流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/chat/completions"),
+            headers=self.target.headers(),
             json={
-                "model": "gpt-image-2",
+                "model": self.target.image_model,
                 "messages": [
                     {"role": "user", "content": "我想做一张南京城市宣传海报图。"},
                 ],
                 "n": 1,
             },
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         payload = response.json()
         content = str((((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or ""))
@@ -83,10 +88,10 @@ class ChatCompletionsTests(unittest.TestCase):
     def test_image_completion_stream_http(self):
         """测试图片对话的流式 HTTP 调用。"""
         response = requests.post(
-            f"{BASE_URL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
+            self.target.url("/v1/chat/completions"),
+            headers=self.target.headers(),
             json={
-                "model": "gpt-image-2",
+                "model": self.target.image_model,
                 "stream": True,
                 "messages": [
                     {"role": "user", "content": "我想做一张南京城市宣传海报图。"},
@@ -94,7 +99,7 @@ class ChatCompletionsTests(unittest.TestCase):
                 "n": 1,
             },
             stream=True,
-            timeout=300,
+            timeout=self.target.timeout_seconds,
         )
         parts: list[str] = []
         started_at = time.time()

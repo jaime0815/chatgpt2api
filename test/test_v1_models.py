@@ -4,13 +4,11 @@ import json
 import unittest
 from unittest import mock
 
+import pytest
 import requests
 
 from services.protocol import openai_v1_models
-
-
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
+from test.live_compat_api import SKIP_REASON, enabled, load_target
 
 
 class ModelListTests(unittest.TestCase):
@@ -62,18 +60,22 @@ class ModelListTests(unittest.TestCase):
         self.assertNotIn("codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
 
+    @pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""
+        load_target()
         result = openai_v1_models.list_models()
         print("function result:")
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
+    @pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
     def test_list_models_http(self):
         """测试通过 HTTP 接口获取模型列表。"""
+        target = load_target()
         response = requests.get(
-            f"{BASE_URL}/v1/models",
-            headers={"Authorization": f"Bearer {AUTH_KEY}"},
-            timeout=30,
+            target.url("/v1/models"),
+            headers=target.headers(),
+            timeout=target.timeout_seconds,
         )
         print("http status:")
         print(response.status_code)
