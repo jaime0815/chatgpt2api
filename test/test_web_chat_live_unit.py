@@ -60,7 +60,7 @@ def test_text_success_rejects_mixed_unusable_and_unexpected_errors() -> None:
         live._assert_completed_text_stream(response)
 
 
-def test_attachment_guard_only_xfails_the_exact_known_unavailable_code() -> None:
+def test_attachment_guard_rejects_mixed_attachment_errors() -> None:
     response = _stream(
         _error("attachment_unavailable"),
         _error("upstream_error"),
@@ -68,7 +68,17 @@ def test_attachment_guard_only_xfails_the_exact_known_unavailable_code() -> None
     )
 
     with pytest.raises(AssertionError, match="unexpected"):
-        live._assert_native_attachment_stream_or_xfail(response, "mixed")
+        live._assert_native_attachment_stream(response, "mixed")
+
+
+def test_attachment_guard_rejects_attachment_unavailable_error() -> None:
+    response = _stream(
+        _error("attachment_unavailable"),
+        "data: [DONE]",
+    )
+
+    with pytest.raises(AssertionError, match="attachment_unavailable"):
+        live._assert_native_attachment_stream(response, "PDF attachment")
 
 
 def test_follow_up_payload_replays_the_attachment_message_in_full_history() -> None:

@@ -35,7 +35,6 @@ _UNUSABLE_ACCOUNT_CODES = {
     "no_available_text_account",
     "upstream_authentication_error",
 }
-_ATTACHMENT_UNAVAILABLE_CODE = "attachment_unavailable"
 _IMAGE_MIME_TYPES = {
     ".png": "image/png",
     ".jpeg": "image/jpeg",
@@ -341,17 +340,13 @@ def live_text_stream(live_target: _LiveChatTarget) -> list[_SseEvent]:
     return _assert_completed_text_stream(response)
 
 
-def _assert_native_attachment_stream_or_xfail(response: httpx.Response, label: str) -> None:
+def _assert_native_attachment_stream(response: httpx.Response, label: str) -> None:
     assert response.status_code == 200, f"{label} request returned HTTP {response.status_code}"
     assert response.headers.get("content-type", "").startswith("text/event-stream")
     events = _sse_events(response.text)
     codes = _error_codes(events)
     if codes and codes <= _UNUSABLE_ACCOUNT_CODES:
         pytest.skip("configured service lost its usable local text account during this live smoke run")
-    if codes == {_ATTACHMENT_UNAVAILABLE_CODE}:
-        pytest.xfail(
-            "native attachment uploader is not wired into the default ChatStreamSession yet"
-        )
     assert not codes, f"{label} stream emitted unexpected public errors: {sorted(codes)}"
     assert events and events[-1].data == "[DONE]", f"{label} stream did not finish with [DONE]"
 
@@ -382,7 +377,7 @@ def test_live_document_attachment_streams_when_uploader_is_available(
         prompt=f"Briefly acknowledge the attached {label}.",
         attachments=[attachment],
     )
-    _assert_native_attachment_stream_or_xfail(response, label)
+    _assert_native_attachment_stream(response, label)
 
 
 def test_live_pdf_follow_up_streams_when_uploader_is_available(
@@ -397,7 +392,7 @@ def test_live_pdf_follow_up_streams_when_uploader_is_available(
         prompt=initial_prompt,
         attachments=[pdf],
     )
-    _assert_native_attachment_stream_or_xfail(initial_response, "PDF attachment")
+    _assert_native_attachment_stream(initial_response, "PDF attachment")
 
     # The web endpoint is stateless: a follow-up replays the persisted history and attachment manifest.
     follow_up = _post_stream(
@@ -420,7 +415,7 @@ def test_live_pdf_follow_up_streams_when_uploader_is_available(
         ],
         attach_to_current_message=False,
     )
-    _assert_native_attachment_stream_or_xfail(follow_up, "PDF follow-up")
+    _assert_native_attachment_stream(follow_up, "PDF follow-up")
 
 
 def test_live_mixed_image_document_streams_when_uploader_is_available(
@@ -435,7 +430,7 @@ def test_live_mixed_image_document_streams_when_uploader_is_available(
         prompt="Briefly acknowledge the attached image and PDF.",
         attachments=[image, pdf],
     )
-    _assert_native_attachment_stream_or_xfail(response, "mixed image and PDF attachment")
+    _assert_native_attachment_stream(response, "mixed image and PDF attachment")
 
 
 def test_live_exactly_ten_images_stream_when_uploader_is_available(
@@ -450,4 +445,4 @@ def test_live_exactly_ten_images_stream_when_uploader_is_available(
         prompt="Briefly acknowledge the ten attached images.",
         attachments=images,
     )
-    _assert_native_attachment_stream_or_xfail(response, "exactly ten image attachments")
+    _assert_native_attachment_stream(response, "exactly ten image attachments")
