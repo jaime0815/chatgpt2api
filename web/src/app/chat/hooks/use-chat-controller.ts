@@ -455,7 +455,11 @@ function isImageTurn(message: ChatMessage) {
 }
 
 function textRequestHistory(messages: readonly ChatMessage[]) {
-  return messages.filter((message) => !isImageTurn(message))
+  return messages
+    .filter((message) => !isImageTurn(message))
+    .map((message) =>
+      message.attachmentIds.length > 0 ? { ...message, attachmentIds: [] } : message,
+    )
 }
 
 function attachmentManifest(attachment: PreparedChatAttachment): ChatAttachmentManifest {

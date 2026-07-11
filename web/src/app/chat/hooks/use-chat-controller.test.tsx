@@ -491,6 +491,72 @@ describe("useChatController", () => {
     expect(dependencies.getAttachments).not.toHaveBeenCalled()
   })
 
+  it("keeps legacy text attachment ids locally but excludes them from a text follow-up request", async () => {
+    const legacyDocument = attachment("l", "legacy.pdf")
+    const legacyImage = {
+      ...attachment("m", "legacy.png"),
+      mimeType: "image/png",
+      kind: "image" as const,
+    }
+    const existing = conversation("conversation-1", [
+      message("user-1", "user", "legacy attachments", "complete", [legacyDocument.id, legacyImage.id]),
+      message("assistant-1", "assistant", "stored answer"),
+    ])
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({
+      conversations: [existing],
+      preferences: { activeConversationId: existing.id },
+      attachments: [legacyDocument, legacyImage],
+      streamChatFn,
+    })
+    const { result } = await renderController(dependencies)
+
+    await act(async () => {
+      await result.current.sendText({ text: "plain follow-up" })
+    })
+
+    expect(result.current.activeConversation?.messages[0]?.attachmentIds).toEqual([
+      legacyDocument.id,
+      legacyImage.id,
+    ])
+    const [request, streamedAttachments] = streamChatFn.mock.calls[0]!
+    expect(request.messages.map((item) => item.attachment_ids)).toEqual([[], [], []])
+    expect(request.attachments).toEqual([])
+    expect(streamedAttachments).toEqual([])
+    expect(dependencies.getAttachments).not.toHaveBeenCalled()
+  })
+
+  it("excludes legacy text attachments from a retry request", async () => {
+    const legacyDocument = attachment("n", "retry.pdf")
+    const existing = conversation("conversation-1", [
+      message("user-1", "user", "legacy retry", "complete", [legacyDocument.id]),
+      message("assistant-1", "assistant", "failed answer", "error"),
+    ])
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({
+      conversations: [existing],
+      preferences: { activeConversationId: existing.id },
+      attachments: [legacyDocument],
+      streamChatFn,
+    })
+    const { result } = await renderController(dependencies)
+
+    await act(async () => {
+      await result.current.retryAssistant("assistant-1")
+    })
+
+    expect(result.current.activeConversation?.messages[0]?.attachmentIds).toEqual([legacyDocument.id])
+    const [request, streamedAttachments] = streamChatFn.mock.calls[0]!
+    expect(request.messages.map((item) => item.attachment_ids)).toEqual([[]])
+    expect(request.attachments).toEqual([])
+    expect(streamedAttachments).toEqual([])
+    expect(dependencies.getAttachments).not.toHaveBeenCalled()
+  })
+
   it("uses the same filtered history when retrying text after an image turn", async () => {
     const reference = attachment("s", "reference.png", "reference")
     const existing = conversation("conversation-1", [
@@ -718,23 +784,23 @@ describe("useChatController", () => {
     })
     getAttachments.mockClear()
 
+    await expect(result.current.resolveAttachments([cachedAttachment.id])).resolves.toEqual([])
+    expect(getAttachments).not.toHaveBeenCalled()
+
     await act(async () => {
-      await result.current.sendText({
-        text: "needs the persisted attachment again",
-        attachmentIds: [cachedAttachment.id],
-      })
+      await result.current.upsertMessage(
+        { ...sourceMessage, id: "cache-source-after-delete" },
+        [cachedAttachment],
+      )
     })
-    expect(getAttachments).toHaveBeenCalledWith(SUBJECT_ID, [cachedAttachment.id])
+    expect(await result.current.resolveAttachments([cachedAttachment.id])).toEqual([cachedAttachment])
 
     getAttachments.mockClear()
     await act(async () => {
       await result.current.clearHistory()
-      await result.current.sendText({
-        text: "does not retain cleared attachment blobs",
-        attachmentIds: [cachedAttachment.id],
-      })
     })
-    expect(getAttachments).toHaveBeenCalledWith(SUBJECT_ID, [cachedAttachment.id])
+    await expect(result.current.resolveAttachments([cachedAttachment.id])).resolves.toEqual([])
+    expect(getAttachments).not.toHaveBeenCalled()
   })
 
   it("edits a user message, preserves omitted attachment references, and truncates its branch", async () => {
@@ -773,9 +839,12 @@ describe("useChatController", () => {
       expect.objectContaining({
         id: "user-1",
         text: "edited prompt",
-        attachment_ids: [originalAttachment.id],
+        attachment_ids: [],
       }),
     ])
+    expect(streamChatFn.mock.calls[0]?.[0].attachments).toEqual([])
+    expect(streamChatFn.mock.calls[0]?.[1]).toEqual([])
+    expect(dependencies.getAttachments).not.toHaveBeenCalled()
     expect(dependencies.releaseUnreferencedAttachments).toHaveBeenCalledWith(SUBJECT_ID)
   })
 
@@ -816,7 +885,7 @@ describe("useChatController", () => {
     expect(dependencies.getAttachments).not.toHaveBeenCalled()
   })
 
-  it("uploads new Blobs before persistence and streams only deduplicated referenced attachments", async () => {
+  it("persists new Blobs locally without forwarding text attachments to the stream", async () => {
     const oldAttachment = attachment("a", "old.txt")
     const newAttachment = attachment("b", "new.txt")
     const unusedAttachment = attachment("c", "unused.txt")
@@ -851,15 +920,12 @@ describe("useChatController", () => {
     expect(dependencies.saveAttachment).toHaveBeenCalledTimes(1)
     const [request, streamedAttachments] = streamChatFn.mock.calls[0]!
     expect(request.thinking_effort).toBe("high")
-    expect(request.attachments.map((item) => item.id)).toEqual([
-      oldAttachment.id,
+    expect(request.messages.map((item) => item.attachment_ids)).toEqual([[], []])
+    expect(request.attachments).toEqual([])
+    expect(streamedAttachments).toEqual([])
+    expect(result.current.activeConversation?.messages.find((item) => item.role === "user" && item.text === "with new")?.attachmentIds).toEqual([
       newAttachment.id,
     ])
-    expect(streamedAttachments.map((item) => item.id)).toEqual([
-      oldAttachment.id,
-      newAttachment.id,
-    ])
-    expect(streamedAttachments).not.toContain(unusedAttachment)
   })
 
   it("persists debounced streaming checkpoints and the final state", async () => {
@@ -1059,7 +1125,7 @@ describe("useChatController", () => {
       expect.objectContaining({ text: "keep my input", attachmentIds: [newAttachment.id] }),
       expect.objectContaining({ text: "still answered", status: "complete" }),
     ])
-    expect(streamChatFn.mock.calls[0]?.[1]).toEqual([newAttachment])
+    expect(streamChatFn.mock.calls[0]?.[1]).toEqual([])
   })
 
   it("keeps quota-failed image references available for a retry resolver", async () => {
@@ -1350,17 +1416,13 @@ describe("useChatController", () => {
     })
 
     const [request, streamedAttachments] = streamChatFn.mock.calls[0]!
-    expect(request.attachments).toEqual([
-      expect.objectContaining({ id: bobAttachment.id, file_name: bobAttachment.name }),
-    ])
-    expect(streamedAttachments).toEqual([bobAttachment])
-    expect(streamedAttachments[0]?.blob).toBe(bobAttachment.blob)
+    expect(request.attachments).toEqual([])
+    expect(streamedAttachments).toEqual([])
   })
 
-  it("loads the current subject attachment after a delayed previous-subject read", async () => {
+  it("does not resolve legacy text attachments across subject changes", async () => {
     const aliceAttachment = attachment("b", "alice-read.txt", "alice bytes")
     const bobAttachment = attachment("b", "bob-read.txt", "bob bytes")
-    const aliceRead = deferred<PreparedChatAttachment[]>()
     const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
       yield { type: "complete" } as const
     })
@@ -1373,26 +1435,14 @@ describe("useChatController", () => {
       selectedModel: "auto",
       scrollPositions: {},
     }))
-    dependencies.getAttachments = vi.fn<ChatControllerDependencies["getAttachments"]>(
-      async (subjectId) => {
-        if (subjectId === SUBJECT_ID) {
-          return aliceRead.promise
-        }
-        return [bobAttachment]
-      },
-    )
     const hook = await renderSubjectController(dependencies)
-    let aliceSending!: Promise<void>
 
-    act(() => {
-      aliceSending = hook.result.current.sendText({
+    await act(async () => {
+      await hook.result.current.sendText({
         text: "alice read",
         attachmentIds: [aliceAttachment.id],
       })
     })
-    await waitFor(() =>
-      expect(dependencies.getAttachments).toHaveBeenCalledWith(SUBJECT_ID, [aliceAttachment.id]),
-    )
 
     act(() => {
       hook.rerender({ subjectId: OTHER_SUBJECT_ID })
@@ -1400,25 +1450,17 @@ describe("useChatController", () => {
     await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
 
     await act(async () => {
-      aliceRead.resolve([aliceAttachment])
-      await aliceSending
-    })
-    await act(async () => {
       await hook.result.current.sendText({
         text: "bob read",
         attachmentIds: [bobAttachment.id],
       })
     })
 
-    expect(dependencies.getAttachments).toHaveBeenLastCalledWith(
-      OTHER_SUBJECT_ID,
-      [bobAttachment.id],
-    )
-    const [request, streamedAttachments] = streamChatFn.mock.calls[0]!
-    expect(request.attachments).toEqual([
-      expect.objectContaining({ id: bobAttachment.id, file_name: bobAttachment.name }),
-    ])
-    expect(streamedAttachments).toEqual([bobAttachment])
-    expect(streamedAttachments[0]?.blob).toBe(bobAttachment.blob)
+    expect(dependencies.getAttachments).not.toHaveBeenCalled()
+    expect(streamChatFn.mock.calls).toHaveLength(2)
+    for (const [request, streamedAttachments] of streamChatFn.mock.calls) {
+      expect(request.attachments).toEqual([])
+      expect(streamedAttachments).toEqual([])
+    }
   })
 })
