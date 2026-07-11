@@ -39,6 +39,10 @@ export type ChatMessageInput = {
   attachmentIds?: readonly string[]
 }
 
+export type ChatMessageUpsertOptions = {
+  conversationId?: string
+}
+
 export type ChatControllerDependencies = {
   streamChatFn: typeof streamChat
   listConversations: typeof listChatConversations
@@ -511,6 +515,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
   const subjectSessionRef = useRef({ subjectId, generation: 0 })
   const activeRunRef = useRef<ActiveRun | null>(null)
   const attachmentCacheRef = useRef(new Map<string, PreparedChatAttachment>())
+  const messageUpsertQueuesRef = useRef(new WeakMap<object, Promise<void>>())
   const checkpointTimersRef = useRef(
     new Map<string, ReturnType<typeof globalThis.setTimeout>>(),
   )
@@ -1096,6 +1101,100 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     [isSubjectReady, startRun],
   )
 
+  const upsertMessage = useCallback(
+    (
+      message: ChatMessage,
+      attachments: readonly PreparedChatAttachment[] = [],
+      options: ChatMessageUpsertOptions = {},
+    ) => {
+      const upsertSession = subjectSessionRef.current
+      const previous = messageUpsertQueuesRef.current.get(upsertSession) || Promise.resolve()
+      const operation = previous.then(async () => {
+        const isCurrentUpsertSession = () =>
+          subjectSessionRef.current === upsertSession &&
+          stateRef.current.subjectId === upsertSession.subjectId &&
+          !stateRef.current.isLoading
+        if (!isSubjectReady() || !isCurrentUpsertSession()) {
+          return null
+        }
+
+        const existingConversation = stateRef.current.conversations.find((conversation) =>
+          conversation.messages.some((item) => item.id === message.id),
+        )
+        const targetConversationId =
+          options.conversationId || existingConversation?.id || stateRef.current.activeConversationId
+
+        for (const attachment of uniqueAttachments(attachments)) {
+          if (!isCurrentUpsertSession()) {
+            return null
+          }
+          attachmentCacheRef.current.set(attachment.id, attachment)
+          const stored = await attemptStorageWrite(() =>
+            dependenciesRef.current.saveAttachment(subjectId, attachment),
+          )
+          if (!isCurrentUpsertSession()) {
+            return null
+          }
+          if (stored.ok) {
+            attachmentCacheRef.current.set(stored.value.id, stored.value)
+          }
+        }
+
+        if (!isCurrentUpsertSession()) {
+          return null
+        }
+        const targetConversation = targetConversationId
+          ? stateRef.current.conversations.find((conversation) => conversation.id === targetConversationId)
+          : null
+        if (targetConversationId && !targetConversation) {
+          return null
+        }
+        const now = dependenciesRef.current.now()
+        const conversation =
+          targetConversation ||
+          {
+            id: dependenciesRef.current.createId(),
+            title: DEFAULT_CONVERSATION_TITLE,
+            createdAt: now.toISOString(),
+            updatedAt: now.toISOString(),
+            model: stateRef.current.selectedModel,
+            messages: [],
+            scrollTop: 0,
+          }
+        const messageIndex = conversation.messages.findIndex((item) => item.id === message.id)
+        const messages = [...conversation.messages]
+        if (messageIndex >= 0) {
+          messages[messageIndex] = message
+        } else {
+          messages.push(message)
+        }
+        const nextConversation: ChatConversation = {
+          ...conversation,
+          messages,
+          updatedAt: nextUpdatedAt(conversation, now),
+        }
+        const activate = !targetConversation && !targetConversationId
+        const next = transition({
+          type: "upsert-conversation",
+          conversation: nextConversation,
+          activate,
+        })
+        await persistConversation(nextConversation)
+        if (activate) {
+          await persistPreferences(next)
+        }
+        return nextConversation
+      })
+      const settled = operation.then(
+        () => undefined,
+        () => undefined,
+      )
+      messageUpsertQueuesRef.current.set(upsertSession, settled)
+      return operation
+    },
+    [attemptStorageWrite, isSubjectReady, persistConversation, persistPreferences, subjectId, transition],
+  )
+
   const stop = useCallback(() => {
     if (!isSubjectReady()) {
       return
@@ -1273,6 +1372,7 @@ export function useChatController({ subjectId, dependencies }: UseChatController
     renameConversation,
     deleteConversation,
     sendText,
+    upsertMessage,
     stop,
     retryAssistant,
     editAndResend,

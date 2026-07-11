@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import type {
   ChatConversation,
+  ChatMessage,
   ChatMessageStatus,
   ChatStreamEvent,
   ChatStreamRequest,
@@ -374,6 +375,178 @@ describe("useChatController", () => {
     expect(streamChatFn.mock.calls[0]?.[0].messages).toEqual([
       expect.objectContaining({ id: "user-1", role: "user", text: "original prompt" }),
     ])
+  })
+
+  it("upserts image-task messages into the active conversation and persists their references", async () => {
+    const imageReference = {
+      ...attachment("i", "reference.png", "image-content"),
+      mimeType: "image/png",
+      kind: "image" as const,
+    }
+    const { dependencies, storedAttachments } = createDependencies()
+    const { result } = await renderController(dependencies)
+    const pendingImage = {
+      id: "image-message",
+      role: "assistant" as const,
+      text: "",
+      attachmentIds: [imageReference.id],
+      status: "queued" as const,
+      createdAt: "2026-07-11T08:00:00.000Z",
+      images: [{ id: "image-1", taskId: "task-1", status: "queued" as const }],
+    }
+
+    await act(async () => {
+      await result.current.upsertMessage(pendingImage, [imageReference])
+    })
+
+    expect(result.current.activeConversation?.messages).toEqual([pendingImage])
+    expect(storedAttachments.get(imageReference.id)).toMatchObject({
+      id: imageReference.id,
+      kind: "image",
+    })
+
+    const completedImage = {
+      ...pendingImage,
+      status: "complete" as const,
+      images: [
+        {
+          id: "image-1",
+          taskId: "task-1",
+          status: "success" as const,
+          url: "/images/task-1.png",
+        },
+      ],
+    }
+    await act(async () => {
+      await result.current.upsertMessage(completedImage)
+    })
+
+    expect(result.current.activeConversation?.messages).toEqual([completedImage])
+    expect(dependencies.saveConversation).toHaveBeenCalled()
+  })
+
+  it("does not upsert a delayed image message after the chat subject changes", async () => {
+    const imageReference = {
+      ...attachment("i", "reference.png", "image-content"),
+      mimeType: "image/png",
+      kind: "image" as const,
+    }
+    const saveAttachment = deferred<PreparedChatAttachment>()
+    const { dependencies } = createDependencies()
+    dependencies.saveAttachment = vi.fn(async () => saveAttachment.promise)
+    const hook = await renderSubjectController(dependencies)
+    const imageMessage: ChatMessage = {
+      id: "delayed-image-message",
+      role: "assistant",
+      text: "city",
+      attachmentIds: [imageReference.id],
+      status: "queued",
+      createdAt: "2026-07-11T08:00:00.000Z",
+      images: [{ id: "image-1", taskId: "task-1", status: "queued" }],
+    }
+
+    let upserting!: Promise<unknown>
+    act(() => {
+      upserting = hook.result.current.upsertMessage(imageMessage, [imageReference])
+    })
+    await waitFor(() => expect(dependencies.saveAttachment).toHaveBeenCalledTimes(1))
+
+    hook.rerender({ subjectId: OTHER_SUBJECT_ID })
+    await waitFor(() => expect(hook.result.current.state.subjectId).toBe(OTHER_SUBJECT_ID))
+    await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
+
+    await act(async () => {
+      saveAttachment.resolve(imageReference)
+      await upserting
+    })
+
+    expect(hook.result.current.state.conversations).toEqual([])
+  })
+
+  it("serializes concurrent image-message upserts that need attachment persistence", async () => {
+    const firstReference = {
+      ...attachment("a", "first.png", "first-image"),
+      mimeType: "image/png",
+      kind: "image" as const,
+    }
+    const secondReference = {
+      ...attachment("b", "second.png", "second-image"),
+      mimeType: "image/png",
+      kind: "image" as const,
+    }
+    const firstSave = deferred<PreparedChatAttachment>()
+    const secondSave = deferred<PreparedChatAttachment>()
+    const { dependencies } = createDependencies()
+    let saveCount = 0
+    dependencies.saveAttachment = vi.fn(async () => {
+      saveCount += 1
+      return saveCount === 1 ? firstSave.promise : secondSave.promise
+    })
+    const { result } = await renderController(dependencies)
+    const firstMessage: ChatMessage = {
+      id: "first-image-message",
+      role: "assistant",
+      text: "first",
+      attachmentIds: [firstReference.id],
+      status: "queued",
+      createdAt: "2026-07-11T08:00:00.000Z",
+      images: [{ id: "first-image", taskId: "first-task", status: "queued" }],
+    }
+    const secondMessage: ChatMessage = {
+      id: "second-image-message",
+      role: "assistant",
+      text: "second",
+      attachmentIds: [secondReference.id],
+      status: "queued",
+      createdAt: "2026-07-11T08:00:01.000Z",
+      images: [{ id: "second-image", taskId: "second-task", status: "queued" }],
+    }
+
+    let firstUpsert!: Promise<unknown>
+    let secondUpsert!: Promise<unknown>
+    act(() => {
+      firstUpsert = result.current.upsertMessage(firstMessage, [firstReference])
+      secondUpsert = result.current.upsertMessage(secondMessage, [secondReference])
+    })
+    await waitFor(() => expect(dependencies.saveAttachment).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      firstSave.resolve(firstReference)
+    })
+    await waitFor(() => expect(dependencies.saveAttachment).toHaveBeenCalledTimes(2))
+    await act(async () => {
+      secondSave.resolve(secondReference)
+      await Promise.all([firstUpsert, secondUpsert])
+    })
+
+    expect(result.current.state.conversations).toHaveLength(1)
+    expect(result.current.activeConversation?.messages).toEqual([firstMessage, secondMessage])
+  })
+
+  it("does not recreate a deleted owner conversation for a late image update", async () => {
+    const existing = conversation("deleted-conversation")
+    const { dependencies } = createDependencies({ conversations: [existing] })
+    const { result } = await renderController(dependencies)
+    const lateImageMessage: ChatMessage = {
+      id: "late-image-message",
+      role: "assistant",
+      text: "city",
+      attachmentIds: [],
+      status: "complete",
+      createdAt: "2026-07-11T08:00:00.000Z",
+      images: [{ id: "image-1", taskId: "task-1", status: "success", url: "/images/task-1.png" }],
+    }
+
+    await act(async () => {
+      await result.current.deleteConversation(existing.id)
+    })
+    await act(async () => {
+      await result.current.upsertMessage(lateImageMessage, [], {
+        conversationId: existing.id,
+      })
+    })
+
+    expect(result.current.state.conversations).toEqual([])
   })
 
   it("edits a user message, preserves omitted attachment references, and truncates its branch", async () => {
