@@ -28,6 +28,7 @@ describe("ChatSidebar", () => {
       onSelectConversation: vi.fn(),
       onRenameConversation: vi.fn(),
       onDeleteConversation: vi.fn(),
+      onClearHistory: vi.fn(),
       onToggleTheme: vi.fn(),
       onSignOut: vi.fn(),
       onNavigate: vi.fn(),
@@ -85,6 +86,17 @@ describe("ChatSidebar", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "删除 更早的对话" }))
     expect(callbacks.onDeleteConversation).toHaveBeenCalledWith("older")
+  })
+
+  it("confirms before clearing local chat history", () => {
+    const callbacks = renderSidebar()
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true)
+
+    fireEvent.click(screen.getByRole("button", { name: "清空聊天记录" }))
+
+    expect(confirm).toHaveBeenCalledOnce()
+    expect(callbacks.onClearHistory).toHaveBeenCalledOnce()
+    confirm.mockRestore()
   })
 
   it("uses unique whitespace-free group labels across desktop and drawer instances", () => {

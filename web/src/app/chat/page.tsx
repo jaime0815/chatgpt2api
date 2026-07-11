@@ -15,29 +15,19 @@ import {
   validateChatAttachments,
 } from "./lib/chat-attachments"
 import { chatImageUrlToFile } from "./lib/chat-images"
+import { loadChatImageSettings, saveChatImageSettings } from "./lib/chat-image-settings"
 import { filterChatModels, resolveChatModelSelection } from "./lib/chat-models"
 import type { ChatGeneratedImage, ChatMessage, PreparedChatAttachment } from "./lib/chat-types"
 import { useChatController } from "./hooks/use-chat-controller"
 import { useChatImageTasks } from "./hooks/use-chat-image-tasks"
 import { ImageLightbox } from "@/components/image-lightbox"
-import {
-  aspectOptions,
-  normalizeImageSettings,
-  type ImageSettings,
-} from "@/app/image/components/image-settings"
+import { normalizeImageSettings, type ImageSettings } from "@/app/image/components/image-settings"
 import { fetchModels } from "@/lib/api"
 import { useAuthGuard } from "@/lib/use-auth-guard"
 import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth"
 import { getChatAttachments } from "@/store/chat-conversations"
 
 const TEXT_ATTACHMENT_UNAVAILABLE = "当前版本暂不支持带附件的普通聊天，请移除附件后发送。"
-const IMAGE_RATIO_STORAGE_KEY = "chatgpt2api:image_last_ratio"
-const IMAGE_TIER_STORAGE_KEY = "chatgpt2api:image_last_tier"
-const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality"
-const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model"
-const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count"
-const IMAGE_WIDTH_STORAGE_KEY = "chatgpt2api:image_last_width"
-const IMAGE_HEIGHT_STORAGE_KEY = "chatgpt2api:image_last_height"
 
 type PreviewAttachment = ChatComposerAttachment
 
@@ -45,47 +35,6 @@ type LightboxImage = {
   id: string
   src: string
   dimensions?: string
-}
-
-function initialImageSettings(): ImageSettings {
-  return normalizeImageSettings({ count: "1" })
-}
-
-function loadSharedImageSettings(): ImageSettings {
-  if (typeof window === "undefined") {
-    return initialImageSettings()
-  }
-  const stored = {
-    model: window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY),
-    quality: window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY),
-    ratio: window.localStorage.getItem(IMAGE_RATIO_STORAGE_KEY),
-    tier: window.localStorage.getItem(IMAGE_TIER_STORAGE_KEY),
-    count: window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY),
-    width: window.localStorage.getItem(IMAGE_WIDTH_STORAGE_KEY),
-    height: window.localStorage.getItem(IMAGE_HEIGHT_STORAGE_KEY),
-  }
-  const normalized = normalizeImageSettings(stored)
-  const preset = aspectOptions.find(
-    (option) => option.ratio === normalized.ratio && option.tier === normalized.tier,
-  )
-  return normalizeImageSettings({
-    ...normalized,
-    width: stored.width || preset?.width || normalized.width,
-    height: stored.height || preset?.height || normalized.height,
-  })
-}
-
-function saveSharedImageSettings(settings: ImageSettings) {
-  if (typeof window === "undefined") {
-    return
-  }
-  window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, settings.model)
-  window.localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, settings.quality)
-  window.localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, settings.ratio)
-  window.localStorage.setItem(IMAGE_TIER_STORAGE_KEY, settings.tier)
-  window.localStorage.setItem(IMAGE_COUNT_STORAGE_KEY, settings.count)
-  window.localStorage.setItem(IMAGE_WIDTH_STORAGE_KEY, settings.width)
-  window.localStorage.setItem(IMAGE_HEIGHT_STORAGE_KEY, settings.height)
 }
 
 function mergeAttachments(
@@ -178,16 +127,21 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   const [draftAttachments, setDraftAttachments] = useState<PreviewAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const [savedAttachments, setSavedAttachments] = useState<PreviewAttachment[]>([])
-  const [imageSettings, setImageSettings] = useState<ImageSettings>(loadSharedImageSettings)
+  const [imageSettings, setImageSettings] = useState<ImageSettings>(() =>
+    loadChatImageSettings(session.subjectId),
+  )
   const [chatModels, setChatModels] = useState<string[]>(["auto"])
   const [imageModels, setImageModels] = useState<string[]>(["gpt-image-2"])
   const [modelsLoaded, setModelsLoaded] = useState(false)
+  const [isImageSubmitPending, setIsImageSubmitPending] = useState(false)
   const [lightboxImages, setLightboxImages] = useState<LightboxImage[]>([])
   const [lightboxIndex, setLightboxIndex] = useState(0)
   const [lightboxOpen, setLightboxOpen] = useState(false)
   const draftAttachmentsRef = useRef<PreviewAttachment[]>([])
   const imageAttachmentCacheRef = useRef(new Map<string, PreparedChatAttachment>())
   const imageMessageOwnersRef = useRef(new Map<string, string>())
+  const discardedImageMessageIdsRef = useRef(new Set<string>())
+  const imageSubmitInFlightRef = useRef(false)
 
   const activeConversation = controller.activeConversation
   const activeAttachmentKey = useMemo(
@@ -228,6 +182,9 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
 
   const persistImageMessage = useCallback(
     async (message: ChatMessage) => {
+      if (discardedImageMessageIdsRef.current.has(message.id)) {
+        return
+      }
       const attachments = message.attachmentIds.flatMap((id) => {
         const attachment = imageAttachmentCacheRef.current.get(id)
         return attachment ? [attachment] : []
@@ -278,8 +235,8 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   }, [controller.state.conversations, draftAttachments])
 
   useEffect(() => {
-    saveSharedImageSettings(imageSettings)
-  }, [imageSettings])
+    saveChatImageSettings(session.subjectId, imageSettings)
+  }, [imageSettings, session.subjectId])
 
   useEffect(() => {
     let cancelled = false
@@ -309,7 +266,6 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
         if (!cancelled) {
           setChatModels(["auto"])
           setImageModels(["gpt-image-2"])
-          setModelsLoaded(true)
         }
       },
     )
@@ -427,15 +383,17 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   }, [])
 
   const handleSubmit = useCallback(async () => {
-    const prompt = input.trim()
+    const submittedInput = input
+    const prompt = submittedInput.trim()
     if (mode === "chat") {
       if (draftAttachmentsRef.current.length > 0) {
         setAttachmentError(TEXT_ATTACHMENT_UNAVAILABLE)
         return
       }
       try {
-        await controller.sendText({ text: prompt })
-        setInput("")
+        const stream = controller.sendText({ text: prompt })
+        setInput((current) => (current === submittedInput ? "" : current))
+        await stream
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "发送消息失败")
       }
@@ -447,6 +405,11 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       setAttachmentError("生成图片模式不能添加文档附件")
       return
     }
+    if (imageSubmitInFlightRef.current) {
+      return
+    }
+    imageSubmitInFlightRef.current = true
+    setIsImageSubmitPending(true)
     try {
       let conversationId = activeConversation?.id || ""
       if (!conversationId) {
@@ -466,10 +429,13 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       })
       draftAttachmentsRef.current.forEach(revokePreview)
       updateDraftAttachments([])
-      setInput("")
+      setInput((current) => (current === submittedInput ? "" : current))
       setAttachmentError(null)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "图片生成失败")
+    } finally {
+      imageSubmitInFlightRef.current = false
+      setIsImageSubmitPending(false)
     }
   }, [
     activeConversation?.id,
@@ -609,6 +575,21 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
     [controller, discardImageMessages],
   )
 
+  const handleClearHistory = useCallback(async () => {
+    const imageMessageIds = new Set([
+      ...controller.state.conversations.flatMap((conversation) =>
+        conversation.messages.flatMap((message) => ((message.images || []).length > 0 ? [message.id] : [])),
+      ),
+      ...imageMessageOwnersRef.current.keys(),
+    ])
+    const removedImageMessageIds = [...imageMessageIds]
+    removedImageMessageIds.forEach((messageId) => discardedImageMessageIdsRef.current.add(messageId))
+    discardImageMessages(removedImageMessageIds)
+    imageMessageOwnersRef.current.clear()
+    imageAttachmentCacheRef.current.clear()
+    await controller.clearHistory()
+  }, [controller, discardImageMessages])
+
   const attachmentWarning =
     attachmentError || (mode === "chat" && draftAttachments.length > 0 ? TEXT_ATTACHMENT_UNAVAILABLE : null)
   const threadAttachments = activeAttachmentIds.length > 0 ? savedAttachments : []
@@ -649,6 +630,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
             onDeleteConversation={(conversationId) => {
               handleDeleteConversation(conversationId)
             }}
+            onClearHistory={() => void handleClearHistory()}
             onToggleTheme={handleThemeToggle}
             onSignOut={() => void handleSignOut()}
             onNavigate={() => setMobileSidebarOpen(false)}
@@ -729,7 +711,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
               onRemoveAttachment={removeDraftAttachment}
               onModeChange={setMode}
               onImageSettingsChange={handleImageSettingsChange}
-              disabled={controller.state.isLoading}
+              disabled={controller.state.isLoading || isImageSubmitPending}
               attachmentError={attachmentWarning}
               activeImageTaskCount={activeTaskIds.length}
             />

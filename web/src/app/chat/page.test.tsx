@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
+import type { ImageSettings } from "@/app/image/components/image-settings"
 import type { ChatMessage } from "@/app/chat/lib/chat-types"
 
 const mocks = vi.hoisted(() => ({
@@ -87,12 +88,14 @@ vi.mock("./components/chat-sidebar", () => ({
     onSignOut,
     onToggleTheme,
     onDeleteConversation,
+    onClearHistory,
   }: {
     chatHref?: string
     imageHref?: string
     onSignOut: () => void
     onToggleTheme: () => void
     onDeleteConversation: (conversationId: string) => void
+    onClearHistory: () => void
   }) => (
     <aside>
       <a data-testid="chat-link" href={`/chatgpt2api${chatHref}`}>聊天</a>
@@ -100,6 +103,7 @@ vi.mock("./components/chat-sidebar", () => ({
       <button type="button" onClick={onToggleTheme}>切换主题</button>
       <button type="button" onClick={onSignOut}>退出登录</button>
       <button type="button" onClick={() => onDeleteConversation("conversation-1")}>删除对话</button>
+      <button type="button" onClick={onClearHistory}>清空聊天记录</button>
     </aside>
   ),
 }))
@@ -139,8 +143,12 @@ vi.mock("./components/chat-composer", () => ({
     onRemoveAttachment,
     attachmentError,
     imageSettings,
+    value,
+    disabled,
   }: {
     mode: string
+    value: string
+    disabled?: boolean
     onValueChange: (value: string) => void
     onSubmit: () => void
     onStop: () => void
@@ -150,10 +158,20 @@ vi.mock("./components/chat-composer", () => ({
     attachmentError?: string | null
     imageSettings: { width: string; height: string; ratio: string; tier: string; count: string }
   }) => {
-    mocks.composerOptions = { onFilesSelected, onRemoveAttachment, onModeChange }
+    mocks.composerOptions = {
+      onValueChange,
+      onSubmit,
+      onFilesSelected,
+      onRemoveAttachment,
+      onModeChange,
+      value,
+      disabled,
+    }
     return (
     <section>
       <output data-testid="composer-mode">{mode}</output>
+      <output data-testid="composer-value">{value}</output>
+      <output data-testid="composer-disabled">{String(Boolean(disabled))}</output>
       <output data-testid="attachment-error">{attachmentError}</output>
       <output data-testid="image-settings">
         {imageSettings.width}x{imageSettings.height} {imageSettings.ratio}/{imageSettings.tier} {imageSettings.count}
@@ -176,6 +194,17 @@ vi.mock("./components/chat-composer", () => ({
 }))
 
 import ChatPage from "./page"
+import { loadChatImageSettings, saveChatImageSettings } from "./lib/chat-image-settings"
+
+const IMAGE_SETTINGS: ImageSettings = {
+  model: "gpt-image-2",
+  quality: "high",
+  width: "1536",
+  height: "1024",
+  ratio: "3:2",
+  tier: "1k",
+  count: "3",
+}
 
 const activeConversation = {
   id: "conversation-1",
@@ -241,14 +270,17 @@ function imageTasks() {
 
 function deferred<Value>() {
   let resolve!: (value: Value) => void
-  const promise = new Promise<Value>((resolvePromise) => {
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise
+    reject = rejectPromise
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
 }
 
 describe("ChatPage", () => {
   beforeEach(() => {
+    localStorage.clear()
     mocks.replace.mockReset()
     mocks.clearStoredAuthSession.mockReset()
     mocks.fetchModels.mockReset()
@@ -345,6 +377,79 @@ describe("ChatPage", () => {
     expect(imageOptions.authKey).toBe("user-key")
   })
 
+  it("keeps chat image settings isolated by subject without inheriting legacy shared settings", () => {
+    localStorage.setItem("chatgpt2api:image_last_model", "legacy-image-model")
+    localStorage.setItem("chatgpt2api:image_last_quality", "high")
+    localStorage.setItem("chatgpt2api:image_last_ratio", "16:9")
+    localStorage.setItem("chatgpt2api:image_last_tier", "2k")
+    localStorage.setItem("chatgpt2api:image_last_count", "12")
+
+    expect(loadChatImageSettings("alice@example.com")).toMatchObject({ count: "1" })
+    expect(loadChatImageSettings("alice@example.com").model).not.toBe("legacy-image-model")
+    expect(loadChatImageSettings("bob@example.com").model).not.toBe("legacy-image-model")
+
+    const aliceSettings = { ...IMAGE_SETTINGS, model: "alice-image", count: "6" }
+    const bobSettings = { ...IMAGE_SETTINGS, model: "bob-image", ratio: "1:1", width: "1024", height: "1024", count: "2" }
+    saveChatImageSettings("alice@example.com", aliceSettings)
+    saveChatImageSettings("bob@example.com", bobSettings)
+    localStorage.setItem("chatgpt2api:image_last_model", "changed-legacy-model")
+
+    expect(loadChatImageSettings("alice@example.com")).toMatchObject(aliceSettings)
+    expect(loadChatImageSettings("bob@example.com")).toMatchObject(bobSettings)
+    expect(loadChatImageSettings("alice@example.com").model).not.toBe("changed-legacy-model")
+  })
+
+  it("clears local chat history and discards active image messages", async () => {
+    const reference = {
+      id: "clear-reference",
+      name: "clear-reference.png",
+      mimeType: "image/png",
+      size: 5,
+      sha256: "c".repeat(64),
+      kind: "image" as const,
+      blob: new Blob(["image"], { type: "image/png" }),
+    }
+    mocks.prepareChatAttachments.mockResolvedValue([reference])
+    render(<ChatPage />)
+
+    const composer = mocks.composerOptions as {
+      onModeChange: (mode: "chat" | "image") => void
+    }
+    await act(async () => {
+      composer.onModeChange("image")
+    })
+    const imageComposer = mocks.composerOptions as {
+      onFilesSelected: (files: File[]) => Promise<void>
+    }
+    await act(async () => {
+      await imageComposer.onFilesSelected([new File(["image"], "clear-reference.png", { type: "image/png" })])
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "清空聊天记录" }))
+
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).toHaveBeenCalledWith(
+      ["assistant-1"],
+    )
+    expect((mocks.controller as ReturnType<typeof controller>).clearHistory).toHaveBeenCalledOnce()
+
+    const imageOptions = mocks.imageOptions as {
+      onMessageChange: (message: ChatMessage) => Promise<void>
+    }
+    const afterClear: ChatMessage = {
+      id: "assistant-1",
+      role: "assistant",
+      text: "draw",
+      attachmentIds: [reference.id],
+      status: "queued",
+      createdAt: "2026-07-11T08:00:00.000Z",
+      images: [{ id: "image-1", taskId: "task-1", status: "success" }],
+    }
+    await act(async () => {
+      await imageOptions.onMessageChange(afterClear)
+    })
+    expect((mocks.controller as ReturnType<typeof controller>).upsertMessage).not.toHaveBeenCalled()
+  })
+
   it("holds the page while authentication is still resolving", () => {
     mocks.authGuard = { isCheckingAuth: true, session: null }
 
@@ -371,10 +476,157 @@ describe("ChatPage", () => {
     await waitFor(() => expect(hydratedController.setSelectedModel).not.toHaveBeenCalled())
   })
 
+  it("keeps a hydrated chat model when the model catalog cannot be loaded", async () => {
+    const hydratedController = controller()
+    hydratedController.state.selectedModel = "gpt-5.2"
+    mocks.controller = hydratedController
+    const catalog = deferred<{ data: Array<{ id: string }> }>()
+    mocks.fetchModels.mockReturnValue(catalog.promise)
+
+    render(<ChatPage />)
+
+    await waitFor(() => expect(mocks.fetchModels).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      catalog.reject(new Error("catalog unavailable"))
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(hydratedController.setSelectedModel).not.toHaveBeenCalled()
+  })
+
+  it("submits one image task while an earlier submit is still pending and releases the guard after failure", async () => {
+    const pendingSubmit = deferred<unknown>()
+    const tasks = imageTasks()
+    tasks.submit = vi.fn(() => pendingSubmit.promise)
+    mocks.imageTasks = tasks
+    render(<ChatPage />)
+
+    const initialComposer = mocks.composerOptions as {
+      onModeChange: (mode: "chat" | "image") => void
+    }
+    await act(async () => {
+      initialComposer.onModeChange("image")
+    })
+    const imageComposer = mocks.composerOptions as {
+      onValueChange: (value: string) => void
+      onSubmit: () => Promise<void>
+    }
+    await act(async () => {
+      imageComposer.onValueChange("draw once")
+    })
+    const readyComposer = mocks.composerOptions as {
+      onSubmit: () => Promise<void>
+    }
+
+    let first!: Promise<void>
+    let second!: Promise<void>
+    act(() => {
+      first = readyComposer.onSubmit()
+      second = readyComposer.onSubmit()
+    })
+    await waitFor(() => expect(tasks.submit).toHaveBeenCalledTimes(1))
+    const firstMessageId = tasks.submit.mock.calls[0]?.[0]?.messageId
+
+    await act(async () => {
+      pendingSubmit.reject(new Error("submit rejected"))
+      await Promise.all([first, second])
+    })
+
+    await act(async () => {
+      await readyComposer.onSubmit()
+    })
+    expect(tasks.submit).toHaveBeenCalledTimes(2)
+    expect(tasks.submit.mock.calls[1]?.[0]?.messageId).not.toBe(firstMessageId)
+  })
+
+  it("keeps a newer image draft when its initial persistence settles", async () => {
+    const pendingSubmit = deferred<unknown>()
+    const tasks = imageTasks()
+    tasks.submit = vi.fn(() => pendingSubmit.promise)
+    mocks.imageTasks = tasks
+    render(<ChatPage />)
+
+    const initialComposer = mocks.composerOptions as {
+      onModeChange: (mode: "chat" | "image") => void
+    }
+    act(() => {
+      initialComposer.onModeChange("image")
+    })
+    const imageComposer = mocks.composerOptions as {
+      onValueChange: (value: string) => void
+      onSubmit: () => Promise<void>
+    }
+    act(() => {
+      imageComposer.onValueChange("P")
+    })
+
+    const submit = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    await waitFor(() => expect(tasks.submit).toHaveBeenCalledOnce())
+    expect(screen.getByTestId("composer-disabled")).toHaveTextContent("true")
+
+    act(() => {
+      ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("Q")
+    })
+    await act(async () => {
+      pendingSubmit.resolve({})
+      await submit
+    })
+
+    expect(screen.getByTestId("composer-value")).toHaveTextContent("Q")
+  })
+
+  it("keeps a newer text draft after its stream completes", async () => {
+    const pendingStream = deferred<void>()
+    const textController = controller()
+    textController.sendText = vi.fn(() => pendingStream.promise)
+    mocks.controller = textController
+    render(<ChatPage />)
+
+    act(() => {
+      ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("P")
+    })
+    const send = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    await waitFor(() => expect(textController.sendText).toHaveBeenCalledWith({ text: "P" }))
+    expect(screen.getByTestId("composer-value")).toBeEmptyDOMElement()
+
+    act(() => {
+      ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("Q")
+    })
+    await act(async () => {
+      pendingStream.resolve()
+      await send
+    })
+
+    expect(screen.getByTestId("composer-value")).toHaveTextContent("Q")
+  })
+
+  it("keeps the text draft when starting its stream throws synchronously", async () => {
+    const textController = controller()
+    textController.sendText = vi.fn(() => {
+      throw new Error("stream start failed")
+    })
+    mocks.controller = textController
+    render(<ChatPage />)
+
+    act(() => {
+      ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("P")
+    })
+    await act(async () => {
+      await (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    })
+
+    expect(screen.getByTestId("composer-value")).toHaveTextContent("P")
+  })
+
   it("restores image dimensions from the shared ratio and tier when older preferences omit them", async () => {
-    localStorage.setItem("chatgpt2api:image_last_ratio", "16:9")
-    localStorage.setItem("chatgpt2api:image_last_tier", "2k")
-    localStorage.setItem("chatgpt2api:image_last_count", "12")
+    saveChatImageSettings("subject-user", {
+      ...IMAGE_SETTINGS,
+      ratio: "16:9",
+      tier: "2k",
+      count: "12",
+      width: "2560",
+      height: "1440",
+    })
 
     render(<ChatPage />)
 

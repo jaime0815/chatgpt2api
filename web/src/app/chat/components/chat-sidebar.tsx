@@ -45,6 +45,7 @@ export type ChatSidebarProps = {
   onSelectConversation: (conversationId: string) => void
   onRenameConversation: (conversationId: string, title: string) => void
   onDeleteConversation: (conversationId: string) => void
+  onClearHistory?: () => void
   onToggleTheme: () => void
   onSignOut: () => void
   onNavigate?: () => void
@@ -97,6 +98,7 @@ export function ChatSidebar({
   onSelectConversation,
   onRenameConversation,
   onDeleteConversation,
+  onClearHistory,
   onToggleTheme,
   onSignOut,
   onNavigate,
@@ -125,7 +127,7 @@ export function ChatSidebar({
         <span className="truncate text-base font-semibold">ChatGPT2API</span>
       </div>
 
-      <div className="flex shrink-0 flex-col gap-1 px-2">
+      <div className="relative flex shrink-0 flex-col gap-1 px-2">
         <Button
           type="button"
           variant="outline"
@@ -138,6 +140,25 @@ export function ChatSidebar({
           <Plus data-icon="inline-start" />
           新对话
         </Button>
+        {conversations.length > 0 && onClearHistory ? (
+          <ChatTooltip label="清空聊天记录">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="absolute top-3 right-3 size-8 text-muted-foreground hover:text-destructive"
+              aria-label="清空聊天记录"
+              onClick={() => {
+                if (window.confirm("确定清空全部本地聊天记录吗？")) {
+                  onClearHistory()
+                  onNavigate?.()
+                }
+              }}
+            >
+              <Trash2 />
+            </Button>
+          </ChatTooltip>
+        ) : null}
         <Link
           href={chatHref}
           onClick={onNavigate}
