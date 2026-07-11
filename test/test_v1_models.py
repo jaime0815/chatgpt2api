@@ -61,14 +61,6 @@ class ModelListTests(unittest.TestCase):
         self.assertNotIn("plus-codex-gpt-image-2", ids)
 
     @pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
-    def test_list_models_function(self):
-        """测试直接调用服务层获取模型列表。"""
-        load_target()
-        result = openai_v1_models.list_models()
-        print("function result:")
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-
-    @pytest.mark.skipif(not enabled(), reason=SKIP_REASON)
     def test_list_models_http(self):
         """测试通过 HTTP 接口获取模型列表。"""
         target = load_target()
@@ -77,7 +69,11 @@ class ModelListTests(unittest.TestCase):
             headers=target.headers(),
             timeout=target.timeout_seconds,
         )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload.get("object"), "list")
+        self.assertIsInstance(payload.get("data"), list)
         print("http status:")
         print(response.status_code)
         print("http result:")
-        print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))

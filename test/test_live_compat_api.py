@@ -36,3 +36,12 @@ def test_live_compat_target_reads_only_explicit_environment(monkeypatch: pytest.
     assert target.text_model == "test-text-model"
     assert target.image_model == "test-image-model"
     assert target.codex_image_model == "test-codex-image-model"
+
+
+def test_live_compat_target_does_not_duplicate_v1_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(live_compat_api.BASE_URL_ENV, "https://example.test/chatgpt2api/v1/")
+    monkeypatch.setenv(live_compat_api.AUTHORIZATION_ENV, "Bearer test-auth")
+
+    target = live_compat_api.load_target()
+
+    assert target.url("/v1/models") == "https://example.test/chatgpt2api/v1/models"

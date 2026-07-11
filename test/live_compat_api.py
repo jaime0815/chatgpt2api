@@ -34,6 +34,8 @@ class LiveCompatTarget:
         return self.authorization.split(" ", 1)[1]
 
     def url(self, path: str) -> str:
+        if self.base_url.endswith("/v1") and (path == "/v1" or path.startswith("/v1/")):
+            path = path[3:]
         return f"{self.base_url}{path}"
 
     def headers(self) -> dict[str, str]:
