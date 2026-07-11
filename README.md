@@ -22,14 +22,26 @@
 ```bash
 git clone git@github.com:basketikun/chatgpt2api.git
 cd chatgpt2api
-docker compose -f docker-compose.local.yml up -d --build
+./scripts/docker-up.sh
 ```
 
 启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.local.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
-- Web 面板：`http://localhost:8000/chatgpt2api/`
-- 普通用户聊天：`http://localhost:8000/chatgpt2api/chat/`（普通用户登录后的默认入口）
-- API 地址：`http://localhost:8000/chatgpt2api/v1`
+如需跳过镜像重建，可显式关闭：
+
+```bash
+./scripts/docker-up.sh --no-build
+```
+
+停止服务：
+
+```bash
+./scripts/docker-stop.sh
+```
+
+- Web 面板：`http://localhost:3000/chatgpt2api/`
+- 普通用户聊天：`http://localhost:3000/chatgpt2api/chat/`（普通用户登录后的默认入口）
+- API 地址：`http://localhost:3000/chatgpt2api/v1`
 - 数据目录：`./data`
 
 Web 面板和同源 API 默认挂在 `/chatgpt2api` 子路径下，便于 nginx redirect/反向代理。普通用户登录后会进入该 `basePath` 下的 `/chat` 路由；按默认配置即为 `/chatgpt2api/chat/`。页面、`/_next` 静态资源、public 图标和同源 `/api`、`/v1` 请求都会走同一前缀：
@@ -42,7 +54,7 @@ Web 面板和同源 API 默认挂在 `/chatgpt2api` 子路径下，便于 nginx 
 
 ```bash
 cp .env.example .env
-docker compose -f docker-compose.warp.yml up -d --build
+./scripts/docker-up.sh --warp
 ```
 
 该 compose 会启动：
@@ -146,11 +158,11 @@ environment:
 
 #### 可选实时聊天附件冒烟测试
 
-该测试需要可访问的真实服务、Bearer 凭证和本地夹具；`LIVE_CHAT_BASE_URL` 必须包含反向代理的 `basePath`，例如默认的 `http://localhost:8000/chatgpt2api`。以下示例中的 `LIVE_CHAT_IMAGE_FILES` 要提供 10 个内容不同的图片路径，Linux/macOS 用 `:` 分隔（Windows 用 `;` 分隔）：
+该测试需要可访问的真实服务、Bearer 凭证和本地夹具；`LIVE_CHAT_BASE_URL` 必须包含反向代理的 `basePath`，例如默认的 `http://localhost:3000/chatgpt2api`。以下示例中的 `LIVE_CHAT_IMAGE_FILES` 要提供 10 个内容不同的图片路径，Linux/macOS 用 `:` 分隔（Windows 用 `;` 分隔）：
 
 ```bash
 RUN_LIVE_CHAT_ATTACHMENTS=1 \
-LIVE_CHAT_BASE_URL=http://localhost:8000/chatgpt2api \
+LIVE_CHAT_BASE_URL=http://localhost:3000/chatgpt2api \
 LIVE_CHAT_AUTHORIZATION='Bearer <auth-key>' \
 LIVE_CHAT_MODEL=auto \
 LIVE_CHAT_TIMEOUT_SECONDS=90 \
@@ -228,7 +240,7 @@ Authorization: Bearer <auth-key>
 返回当前暴露的图片模型列表。
 
 ```bash
-curl http://localhost:8000/v1/models \
+curl http://localhost:3000/v1/models \
   -H "Authorization: Bearer <auth-key>"
 ```
 
@@ -252,7 +264,7 @@ curl http://localhost:8000/v1/models \
 OpenAI 兼容图片生成接口，用于文生图。
 
 ```bash
-curl http://localhost:8000/v1/images/generations \
+curl http://localhost:3000/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
@@ -285,7 +297,7 @@ curl http://localhost:8000/v1/images/generations \
 OpenAI 兼容图片编辑接口，可上传图片文件，也可按官方 JSON 格式传入图片链接并生成编辑结果。
 
 ```bash
-curl http://localhost:8000/v1/images/edits \
+curl http://localhost:3000/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
   -F "model=gpt-image-2" \
   -F "prompt=把这张图改成赛博朋克夜景风格" \
@@ -296,7 +308,7 @@ curl http://localhost:8000/v1/images/edits \
 也可以直接传图片 URL：
 
 ```bash
-curl http://localhost:8000/v1/images/edits \
+curl http://localhost:3000/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -332,7 +344,7 @@ curl http://localhost:8000/v1/images/edits \
 面向文本、网页搜索与图片场景的 Chat Completions 兼容接口，不是完整通用聊天代理。
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
@@ -371,7 +383,7 @@ curl http://localhost:8000/v1/chat/completions \
 面向文本、网页搜索和图片生成工具调用的 Responses API 兼容接口，不是完整通用 Responses API 代理。
 
 ```bash
-curl http://localhost:8000/v1/responses \
+curl http://localhost:3000/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{

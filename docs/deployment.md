@@ -28,6 +28,30 @@ git --version
 
 升级和迁移时重点保留以上内容。
 
+## 统一启动脚本
+
+仓库内置了统一入口脚本：
+
+```bash
+./scripts/docker-up.sh
+```
+
+默认行为：
+
+- 启动 `local` 部署
+- 执行 `docker compose up -d --build`
+- 自动按当前机器架构注入构建平台参数
+
+常用示例：
+
+```bash
+./scripts/docker-up.sh --no-build
+./scripts/docker-up.sh --warp
+./scripts/docker-up.sh --warp --no-build
+./scripts/docker-stop.sh
+./scripts/docker-stop.sh --warp
+```
+
 ## 方式一：普通 Docker 部署
 
 适合不需要 WARP / FlareSolverr 清障的场景。
@@ -47,19 +71,19 @@ environment:
 启动：
 
 ```bash
-docker compose -f docker-compose.local.yml up -d --build
+./scripts/docker-up.sh
 ```
 
 访问：
 
 ```text
-http://localhost:8000/chatgpt2api/
+http://localhost:3000/chatgpt2api/
 ```
 
 API 基础地址：
 
 ```text
-http://localhost:8000/chatgpt2api/v1
+http://localhost:3000/chatgpt2api/v1
 ```
 
 查看日志：
@@ -71,7 +95,7 @@ docker logs -f chatgpt2api
 停止：
 
 ```bash
-docker compose down
+./scripts/docker-stop.sh
 ```
 
 ## 方式二：WARP / FlareSolverr 部署
@@ -99,7 +123,7 @@ CHATGPT2API_AUTH_KEY=your_secret_key_here
 启动：
 
 ```bash
-docker compose -f docker-compose.warp.yml up -d --build
+./scripts/docker-up.sh --warp
 ```
 
 访问：
@@ -126,7 +150,7 @@ docker logs -f chatgpt2api-flaresolverr
 停止：
 
 ```bash
-docker compose -f docker-compose.warp.yml down
+./scripts/docker-stop.sh --warp
 ```
 
 ## 方式三：源码运行

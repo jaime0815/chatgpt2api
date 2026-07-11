@@ -4,11 +4,14 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        BUILDPLATFORM: ${BUILDPLATFORM:-linux/amd64}
+        TARGETPLATFORM: ${TARGETPLATFORM:-linux/amd64}
+        TARGETARCH: ${TARGETARCH:-amd64}
         NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-/chatgpt2api}
     image: chatgpt2api:local
     container_name: chatgpt2api-local
     ports:
-      - "8000:80"
+      - "3000:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
