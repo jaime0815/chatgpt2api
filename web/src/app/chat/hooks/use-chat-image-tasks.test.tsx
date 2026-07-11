@@ -404,6 +404,173 @@ describe("useChatImageTasks", () => {
     )
   })
 
+  it("starts only one retry while the first retry is persisting its queued image", async () => {
+    const queuedPersistence = deferred<void>()
+    let queuedEmits = 0
+    const dependencies = createDependencies()
+    const onMessageChange = vi.fn(async (next: ChatMessage) => {
+      if (next.status === "queued" && queuedEmits++ === 0) {
+        await queuedPersistence.promise
+      }
+    })
+    const message: ChatMessage = {
+      id: "assistant-retry-lock",
+      role: "assistant",
+      text: "retry once",
+      attachmentIds: [],
+      status: "error",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      imageSettings: { ...SETTINGS, count: 1, mode: "generate" },
+      images: [{ id: "failed-image", taskId: "old-task", status: "error", error: "生成失败" }],
+    }
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    let firstRetry!: Promise<ChatMessage>
+    let secondRetry!: Promise<ChatMessage>
+    act(() => {
+      firstRetry = result.current.retryImageTask(message, "failed-image", { prompt: "retry once" })
+      secondRetry = result.current.retryImageTask(message, "failed-image", { prompt: "retry once" })
+    })
+
+    await Promise.resolve()
+    expect(onMessageChange).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      queuedPersistence.resolve()
+      await Promise.all([firstRetry, secondRetry])
+    })
+    await waitFor(() => expect(dependencies.createImageGenerationTask).toHaveBeenCalledOnce())
+  })
+
+  it("does not recreate a discarded retry after its stored references finish resolving", async () => {
+    const restoredReferences = deferred<PreparedChatAttachment[]>()
+    const dependencies = createDependencies()
+    const resolveAttachments = vi.fn(async () => restoredReferences.promise)
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const message: ChatMessage = {
+      id: "assistant-discarded-retry",
+      role: "assistant",
+      text: "",
+      attachmentIds: ["stored-reference"],
+      status: "error",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      imageSettings: {
+        ...SETTINGS,
+        count: 1,
+        mode: "edit",
+        referenceAttachmentIds: ["stored-reference"],
+      },
+      images: [{ id: "failed-edit", taskId: "old-edit-task", status: "error", error: "生成失败" }],
+    }
+    const { result } = renderHook(() =>
+      useChatImageTasks({
+        onMessageChange,
+        dependencies,
+        pollIntervalMs: 0,
+        resolveAttachments,
+      }),
+    )
+
+    let retry!: Promise<ChatMessage>
+    act(() => {
+      retry = result.current.retryImageTask(message, "failed-edit", { prompt: "retry edit" })
+    })
+    await waitFor(() => expect(resolveAttachments).toHaveBeenCalledWith(["stored-reference"]))
+
+    act(() => {
+      result.current.discardImageMessages([message.id])
+    })
+    await act(async () => {
+      restoredReferences.resolve([reference("stored-reference")])
+      await retry
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(onMessageChange).not.toHaveBeenCalled()
+    expect(dependencies.createImageEditTask).not.toHaveBeenCalled()
+    expect(dependencies.fetchImageTasks).not.toHaveBeenCalled()
+  })
+
+  it("does not start a task after clearing a message with a pending persistence callback", async () => {
+    const queuedPersistence = deferred<void>()
+    const dependencies = createDependencies()
+    const onMessageChange = vi.fn(async (message: ChatMessage) => {
+      if (message.status === "queued") {
+        await queuedPersistence.promise
+      }
+    })
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    let submission!: Promise<ChatMessage>
+    act(() => {
+      submission = result.current.submit({
+        prompt: "draw city",
+        settings: { ...SETTINGS, count: "1" },
+      })
+    })
+    await waitFor(() => expect(onMessageChange).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "queued" }),
+    ))
+    const queued = onMessageChange.mock.calls[0]?.[0] as ChatMessage
+
+    act(() => {
+      result.current.discardImageMessages([queued.id])
+    })
+    await act(async () => {
+      queuedPersistence.resolve()
+      await submission
+      await Promise.resolve()
+    })
+
+    expect(dependencies.createImageGenerationTask).not.toHaveBeenCalled()
+    expect(dependencies.fetchImageTasks).not.toHaveBeenCalled()
+    expect(result.current.activeTaskIds).toEqual([])
+  })
+
+  it("does not resume or poll a task that was discarded while the resume request was pending", async () => {
+    const resumedTask = deferred<ImageTask>()
+    const dependencies = createDependencies({
+      resumeImagePoll: vi.fn(async () => resumedTask.promise),
+    })
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const message: ChatMessage = {
+      id: "assistant-discarded-resume",
+      role: "assistant",
+      text: "",
+      attachmentIds: [],
+      status: "error",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      images: [{ id: "timed-out", taskId: "timed-out-task", status: "error", error: "生成超时" }],
+    }
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    let resume!: Promise<ChatMessage>
+    act(() => {
+      resume = result.current.resumeImageTask(message, "timed-out-task")
+    })
+    await waitFor(() => expect(dependencies.resumeImagePoll).toHaveBeenCalledWith("timed-out-task"))
+
+    act(() => {
+      result.current.discardImageMessages([message.id])
+    })
+    await act(async () => {
+      resumedTask.resolve(task("timed-out-task", "running"))
+      await resume
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(onMessageChange).not.toHaveBeenCalled()
+    expect(dependencies.fetchImageTasks).not.toHaveBeenCalled()
+  })
+
   it("restores persisted reference attachments before retrying an edit turn", async () => {
     const dependencies = createDependencies()
     const resolveAttachments = vi.fn(async () => [reference("stored-reference")])

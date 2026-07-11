@@ -185,6 +185,8 @@ export function useChatImageTasks({
   authKeyRef.current = authKey
   const messagesRef = useRef(new Map<string, ChatMessage>())
   const pollersRef = useRef(new Map<string, Promise<void>>())
+  const messageEpochsRef = useRef(new Map<string, number>())
+  const retryLocksRef = useRef(new Map<string, Map<string, number>>())
   const disposedRef = useRef(false)
   const [activeTaskIds, setActiveTaskIds] = useState<string[]>([])
 
@@ -195,8 +197,29 @@ export function useChatImageTasks({
     }
   }, [])
 
-  const emit = useCallback(async (message: ChatMessage) => {
-    if (disposedRef.current) {
+  const registerMessage = useCallback((message: ChatMessage, replace = false) => {
+    const existing = messagesRef.current.get(message.id)
+    const existingEpoch = messageEpochsRef.current.get(message.id)
+    if (existing && existingEpoch !== undefined && !replace) {
+      return { message: existing, epoch: existingEpoch }
+    }
+    const epoch = (existingEpoch || 0) + 1
+    messagesRef.current.set(message.id, message)
+    messageEpochsRef.current.set(message.id, epoch)
+    pollersRef.current.delete(message.id)
+    return { message, epoch }
+  }, [])
+
+  const isMessageActive = useCallback(
+    (messageId: string, epoch: number) =>
+      !disposedRef.current &&
+      messageEpochsRef.current.get(messageId) === epoch &&
+      messagesRef.current.has(messageId),
+    [],
+  )
+
+  const emit = useCallback(async (message: ChatMessage, epoch: number) => {
+    if (!isMessageActive(message.id, epoch)) {
       return message
     }
     messagesRef.current.set(message.id, message)
@@ -215,13 +238,13 @@ export function useChatImageTasks({
     })
     await onMessageChangeRef.current(message)
     return message
-  }, [])
+  }, [isMessageActive])
 
   const pollMessage = useCallback(
-    async (messageId: string, immediate = false) => {
+    async (messageId: string, epoch: number, immediate = false) => {
       let consecutiveErrors = 0
       let firstRequest = true
-      while (!disposedRef.current) {
+      while (isMessageActive(messageId, epoch)) {
         const current = messagesRef.current.get(messageId)
         if (!current) {
           return
@@ -233,7 +256,7 @@ export function useChatImageTasks({
         if (pollIntervalMs > 0 && (!immediate || !firstRequest)) {
           await dependenciesRef.current.wait(pollIntervalMs)
         }
-        if (disposedRef.current || !messagesRef.current.has(messageId)) {
+        if (!isMessageActive(messageId, epoch)) {
           return
         }
         try {
@@ -241,6 +264,9 @@ export function useChatImageTasks({
           const taskList = workspaceAuthKey
             ? await dependenciesRef.current.fetchImageTasks(ids, workspaceAuthKey)
             : await dependenciesRef.current.fetchImageTasks(ids)
+          if (!isMessageActive(messageId, epoch)) {
+            return
+          }
           firstRequest = false
           consecutiveErrors = 0
           const latest = messagesRef.current.get(messageId)
@@ -254,30 +280,39 @@ export function useChatImageTasks({
           if (taskList.missing_ids.length > 0) {
             next = setMissingTaskErrors(next, taskList.missing_ids)
           }
-          await emit(next)
+          await emit(next, epoch)
+          if (!isMessageActive(messageId, epoch)) {
+            return
+          }
         } catch (error) {
+          if (!isMessageActive(messageId, epoch)) {
+            return
+          }
           firstRequest = false
           consecutiveErrors += 1
           if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
             const latest = messagesRef.current.get(messageId)
             if (latest) {
-              await emit(setPendingImagesError(latest, errorMessage(error)))
+              await emit(setPendingImagesError(latest, errorMessage(error)), epoch)
             }
             return
           }
         }
       }
     },
-    [emit, pollIntervalMs],
+    [emit, isMessageActive, pollIntervalMs],
   )
 
   const ensurePolling = useCallback(
-    (messageId: string, immediate = false) => {
+    (messageId: string, epoch: number, immediate = false) => {
+      if (!isMessageActive(messageId, epoch)) {
+        return Promise.resolve()
+      }
       const existing = pollersRef.current.get(messageId)
       if (existing) {
         return existing
       }
-      const poller = pollMessage(messageId, immediate).finally(() => {
+      const poller = pollMessage(messageId, epoch, immediate).finally(() => {
         if (pollersRef.current.get(messageId) === poller) {
           pollersRef.current.delete(messageId)
         }
@@ -285,7 +320,7 @@ export function useChatImageTasks({
       pollersRef.current.set(messageId, poller)
       return poller
     },
-    [pollMessage],
+    [isMessageActive, pollMessage],
   )
 
   const runPendingTasks = useCallback(
@@ -295,7 +330,11 @@ export function useChatImageTasks({
       settings: ChatImageSettingsSnapshot,
       references: readonly PreparedChatAttachment[],
       placeholderIds: readonly string[],
+      epoch: number,
     ) => {
+      if (!isMessageActive(messageId, epoch)) {
+        return
+      }
       try {
         const referenceFiles = settings.mode === "edit" ? taskFiles(references) : []
         const workspaceAuthKey = String(authKeyRef.current || "").trim()
@@ -304,6 +343,9 @@ export function useChatImageTasks({
         }
         const submitted = await Promise.allSettled(
           placeholderIds.map(async (placeholderId) => {
+            if (!isMessageActive(messageId, epoch)) {
+              return null
+            }
             const taskId = messagesRef.current
               .get(messageId)
               ?.images?.find((image) => image.id === placeholderId)?.taskId
@@ -346,11 +388,17 @@ export function useChatImageTasks({
                       imageSize(settings),
                       settings.quality,
                     )
+            if (!isMessageActive(messageId, epoch)) {
+              return null
+            }
             return { placeholderId, task }
           }),
         )
+        if (!isMessageActive(messageId, epoch)) {
+          return
+        }
         let next = messagesRef.current.get(messageId)
-        if (!next || disposedRef.current) {
+        if (!next) {
           return
         }
         for (let index = 0; index < submitted.length; index += 1) {
@@ -366,16 +414,22 @@ export function useChatImageTasks({
           const linked = replaceMessageImageTaskId(next, result.value.placeholderId, result.value.task)
           next = applyImageTaskToChatMessage(linked, result.value.task)
         }
-        await emit(next)
-        await ensurePolling(messageId)
+        await emit(next, epoch)
+        if (!isMessageActive(messageId, epoch)) {
+          return
+        }
+        await ensurePolling(messageId, epoch)
       } catch (error) {
+        if (!isMessageActive(messageId, epoch)) {
+          return
+        }
         const current = messagesRef.current.get(messageId)
-        if (current && !disposedRef.current) {
-          await emit(setPendingImagesError(current, errorMessage(error)))
+        if (current) {
+          await emit(setPendingImagesError(current, errorMessage(error)), epoch)
         }
       }
     },
-    [emit, ensurePolling],
+    [emit, ensurePolling, isMessageActive],
   )
 
   const submit = useCallback(
@@ -405,11 +459,14 @@ export function useChatImageTasks({
         imageSettings: settings,
         images: taskIds.map(pendingImage),
       }
-      await emit(message)
-      void runPendingTasks(messageId, prompt, settings, references, taskIds)
+      const { epoch } = registerMessage(message, true)
+      await emit(message, epoch)
+      if (isMessageActive(messageId, epoch)) {
+        void runPendingTasks(messageId, prompt, settings, references, taskIds, epoch)
+      }
       return message
     },
-    [emit, runPendingTasks],
+    [emit, isMessageActive, registerMessage, runPendingTasks],
   )
 
   const recoverImageMessages = useCallback(
@@ -425,24 +482,26 @@ export function useChatImageTasks({
         if (pendingTaskIds(current).length === 0) {
           continue
         }
-        messagesRef.current.set(current.id, current)
-        pending.push(current)
-        void ensurePolling(current.id, true)
+        const { message: registered, epoch } = registerMessage(current)
+        pending.push(registered)
+        void ensurePolling(registered.id, epoch, true)
       }
       return pending
     },
-    [ensurePolling],
+    [ensurePolling, registerMessage],
   )
 
   const discardImageMessages = useCallback((messageIds: readonly string[]) => {
     const taskIds = new Set<string>()
     for (const messageId of messageIds) {
+      messageEpochsRef.current.set(messageId, (messageEpochsRef.current.get(messageId) || 0) + 1)
+      retryLocksRef.current.delete(messageId)
+      pollersRef.current.delete(messageId)
       const message = messagesRef.current.get(messageId)
-      if (!message) {
-        continue
-      }
-      for (const taskId of pendingTaskIds(message)) {
-        taskIds.add(taskId)
+      if (message) {
+        for (const taskId of pendingTaskIds(message)) {
+          taskIds.add(taskId)
+        }
       }
       messagesRef.current.delete(messageId)
     }
@@ -453,69 +512,126 @@ export function useChatImageTasks({
 
   const resumeImageTask = useCallback(
     async (message: ChatMessage, taskId: string) => {
-      messagesRef.current.set(message.id, message)
+      const { message: registered, epoch } = registerMessage(message)
       const workspaceAuthKey = String(authKeyRef.current || "").trim()
       const task = workspaceAuthKey
         ? await dependenciesRef.current.resumeImagePoll(taskId, undefined, workspaceAuthKey)
         : await dependenciesRef.current.resumeImagePoll(taskId)
+      if (!isMessageActive(registered.id, epoch)) {
+        return messagesRef.current.get(registered.id) || registered
+      }
+      const current = messagesRef.current.get(registered.id)
+      if (!current) {
+        return registered
+      }
       const resumed: ChatMessage = {
-        ...message,
-        images: (message.images || []).map((image) =>
+        ...current,
+        images: (current.images || []).map((image) =>
           image.taskId === taskId ? { ...image, status: "running" as const, error: undefined } : image,
         ),
       }
-      const next = await emit(applyImageTaskToChatMessage(resumed, task))
+      const next = await emit(applyImageTaskToChatMessage(resumed, task), epoch)
+      if (!isMessageActive(next.id, epoch)) {
+        return messagesRef.current.get(next.id) || next
+      }
       if (pendingTaskIds(next).length > 0) {
-        await ensurePolling(next.id)
+        await ensurePolling(next.id, epoch)
       }
       return messagesRef.current.get(next.id) || next
     },
-    [emit, ensurePolling],
+    [emit, ensurePolling, isMessageActive, registerMessage],
   )
 
   const retryImageTask = useCallback(
     async (message: ChatMessage, imageId: string, input: ChatImageRetryInput) => {
-      const image = message.images?.find((item) => item.id === imageId)
+      const current = messagesRef.current.get(message.id) || message
+      const image = current.images?.find((item) => item.id === imageId)
       if (!image) {
         throw new Error("未找到要重试的图片")
+      }
+      if (image.status === "queued" || image.status === "running") {
+        return current
       }
       const prompt = input.prompt.trim()
       if (!prompt) {
         throw new Error("图片提示词不能为空")
       }
-      const snapshot = message.imageSettings
+      const snapshot = current.imageSettings
       if (!snapshot) {
         throw new Error("缺少图片生成参数，无法重试")
       }
-      const savedReferenceIds = snapshot.referenceAttachmentIds || message.attachmentIds
-      const references = input.references?.length
-        ? [...input.references]
-        : savedReferenceIds.length > 0 && resolveAttachments
-          ? [...(await resolveAttachments(savedReferenceIds))]
-          : []
-      validateReferences(references)
-      const mode: ChatImageSettingsSnapshot["mode"] = references.length > 0 ? "edit" : snapshot.mode
-      const settings = chatImageSettingsSnapshot(
-        snapshotToSettings(snapshot),
-        mode,
-        uniqueAttachmentIds(references),
-      )
-      const taskId = dependenciesRef.current.createId()
-      const next: ChatMessage = {
-        ...message,
-        attachmentIds: uniqueAttachmentIds(references),
-        imageSettings: settings,
-        status: "queued",
-        error: undefined,
-        images: (message.images || []).map((item) =>
-          item.id === imageId ? { ...pendingImage(taskId), id: item.id } : item,
-        ),
+      const { message: registered, epoch } = registerMessage(current)
+      const registeredImage = registered.images?.find((item) => item.id === imageId)
+      if (registeredImage?.status === "queued" || registeredImage?.status === "running") {
+        return registered
       }
-      await emit(next)
-      void runPendingTasks(next.id, prompt, settings, references, [imageId])
-      return next
+      let locks = retryLocksRef.current.get(registered.id)
+      if (locks?.get(imageId) === epoch) {
+        return registered
+      }
+      if (!locks) {
+        locks = new Map<string, number>()
+        retryLocksRef.current.set(registered.id, locks)
+      }
+      locks.set(imageId, epoch)
+
+      try {
+        const savedReferenceIds = snapshot.referenceAttachmentIds || registered.attachmentIds
+        const references = input.references?.length
+          ? [...input.references]
+          : savedReferenceIds.length > 0 && resolveAttachments
+            ? [...(await resolveAttachments(savedReferenceIds))]
+            : []
+        if (!isMessageActive(registered.id, epoch)) {
+          return messagesRef.current.get(registered.id) || registered
+        }
+        const live = messagesRef.current.get(registered.id)
+        if (!live) {
+          return registered
+        }
+        const liveImage = live.images?.find((item) => item.id === imageId)
+        if (liveImage?.status === "queued" || liveImage?.status === "running") {
+          return live
+        }
+        const liveSnapshot = live.imageSettings
+        if (!liveSnapshot) {
+          throw new Error("缺少图片生成参数，无法重试")
+        }
+        validateReferences(references)
+        const mode: ChatImageSettingsSnapshot["mode"] = references.length > 0 ? "edit" : liveSnapshot.mode
+        const settings = chatImageSettingsSnapshot(
+          snapshotToSettings(liveSnapshot),
+          mode,
+          uniqueAttachmentIds(references),
+        )
+        const taskId = dependenciesRef.current.createId()
+        const next: ChatMessage = {
+          ...live,
+          attachmentIds: uniqueAttachmentIds(references),
+          imageSettings: settings,
+          status: "queued",
+          error: undefined,
+          images: (live.images || []).map((item) =>
+            item.id === imageId ? { ...pendingImage(taskId), id: item.id } : item,
+          ),
+        }
+        await emit(next, epoch)
+        if (!isMessageActive(next.id, epoch)) {
+          return messagesRef.current.get(next.id) || next
+        }
+        void runPendingTasks(next.id, prompt, settings, references, [imageId], epoch)
+        return next
+      } finally {
+        const currentLocks = retryLocksRef.current.get(registered.id)
+        if (currentLocks?.get(imageId) === epoch) {
+          currentLocks.delete(imageId)
+          if (currentLocks.size === 0) {
+            retryLocksRef.current.delete(registered.id)
+          }
+        }
+      }
     },
-    [emit, resolveAttachments, runPendingTasks],
+    [emit, isMessageActive, registerMessage, resolveAttachments, runPendingTasks],
   )
 
   return {
