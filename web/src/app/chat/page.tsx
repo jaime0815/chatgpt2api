@@ -182,19 +182,15 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
 
   const persistImageMessage = useCallback(
     async (message: ChatMessage) => {
-      if (discardedImageMessageIdsRef.current.has(message.id)) {
+      const conversationId = imageMessageOwnersRef.current.get(message.id)
+      if (discardedImageMessageIdsRef.current.has(message.id) || !conversationId) {
         return
       }
       const attachments = message.attachmentIds.flatMap((id) => {
         const attachment = imageAttachmentCacheRef.current.get(id)
         return attachment ? [attachment] : []
       })
-      const conversationId = imageMessageOwnersRef.current.get(message.id)
-      await controller.upsertMessage(
-        message,
-        attachments,
-        conversationId ? { conversationId } : undefined,
-      )
+      await controller.upsertMessage(message, attachments, { conversationId })
       for (const attachment of attachments) {
         imageAttachmentCacheRef.current.delete(attachment.id)
       }
@@ -219,6 +215,51 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
     authKey: session.key,
     resolveAttachments: resolveImageAttachments,
   })
+
+  const discardTrackedImageMessages = useCallback(
+    (
+      messages: readonly ChatMessage[],
+      extraMessageIds: readonly string[] = [],
+      clearAllCachedAttachments = false,
+    ) => {
+      const imageMessages = messages.filter((message) => (message.images || []).length > 0)
+      const imageMessageIds = new Set([
+        ...imageMessages.map((message) => message.id),
+        ...extraMessageIds,
+      ])
+      if (imageMessageIds.size === 0) {
+        return
+      }
+
+      const removedImageMessageIds = [...imageMessageIds]
+      removedImageMessageIds.forEach((messageId) => discardedImageMessageIdsRef.current.add(messageId))
+      discardImageMessages(removedImageMessageIds)
+      removedImageMessageIds.forEach((messageId) => imageMessageOwnersRef.current.delete(messageId))
+
+      if (clearAllCachedAttachments) {
+        imageAttachmentCacheRef.current.clear()
+        return
+      }
+
+      const removedAttachmentIds = new Set(
+        imageMessages.flatMap((message) => message.attachmentIds),
+      )
+      const retainedAttachmentIds = new Set([
+        ...draftAttachmentsRef.current.map((attachment) => attachment.id),
+        ...controller.state.conversations.flatMap((conversation) =>
+          conversation.messages
+            .filter((message) => !imageMessageIds.has(message.id))
+            .flatMap((message) => message.attachmentIds),
+        ),
+      ])
+      for (const attachmentId of removedAttachmentIds) {
+        if (!retainedAttachmentIds.has(attachmentId)) {
+          imageAttachmentCacheRef.current.delete(attachmentId)
+        }
+      }
+    },
+    [controller.state.conversations, discardImageMessages],
+  )
 
   useEffect(() => {
     const retainedAttachmentIds = new Set([
@@ -455,9 +496,42 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
       if (inputValue.attachmentIds.length > 0 || inputValue.files.length > 0) {
         throw new Error(TEXT_ATTACHMENT_UNAVAILABLE)
       }
+      if (controller.isStreaming) {
+        throw new Error("当前已有回复正在生成")
+      }
+      const conversation = activeConversation
+      const message = conversation?.messages.find((item) => item.id === messageId)
+      if (!conversation || !message || message.role !== "user") {
+        throw new Error("没有找到要编辑的用户消息")
+      }
+      const messageIndex = conversation.messages.findIndex((item) => item.id === messageId)
+      discardTrackedImageMessages(conversation.messages.slice(messageIndex + 1))
       await controller.editAndResend(messageId, { text: inputValue.text, attachmentIds: [] })
     },
-    [controller],
+    [activeConversation?.messages, controller, discardTrackedImageMessages],
+  )
+
+  const handleRetryAssistant = useCallback(
+    async (messageId: string) => {
+      if (controller.isStreaming) {
+        toast.error("当前已有回复正在生成")
+        return
+      }
+      const conversation = activeConversation
+      const message = conversation?.messages.find((item) => item.id === messageId)
+      if (!conversation || !message || message.role !== "assistant") {
+        toast.error("没有找到要重新生成的助手消息")
+        return
+      }
+      const messageIndex = conversation.messages.findIndex((item) => item.id === messageId)
+      discardTrackedImageMessages(conversation.messages.slice(messageIndex))
+      try {
+        await controller.retryAssistant(messageId)
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "重新生成失败")
+      }
+    },
+    [activeConversation?.messages, controller, discardTrackedImageMessages],
   )
 
   const handleUseImageAsReference = useCallback(
@@ -564,31 +638,21 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
   const handleDeleteConversation = useCallback(
     (conversationId: string) => {
       const conversation = controller.state.conversations.find((item) => item.id === conversationId)
-      discardImageMessages(
-        conversation?.messages.flatMap((message) => ((message.images || []).length > 0 ? [message.id] : [])) || [],
-      )
-      conversation?.messages.forEach((message) => {
-        imageMessageOwnersRef.current.delete(message.id)
-      })
+      discardTrackedImageMessages(conversation?.messages || [])
       void controller.deleteConversation(conversationId)
     },
-    [controller, discardImageMessages],
+    [controller, discardTrackedImageMessages],
   )
 
   const handleClearHistory = useCallback(async () => {
-    const imageMessageIds = new Set([
-      ...controller.state.conversations.flatMap((conversation) =>
-        conversation.messages.flatMap((message) => ((message.images || []).length > 0 ? [message.id] : [])),
-      ),
-      ...imageMessageOwnersRef.current.keys(),
-    ])
-    const removedImageMessageIds = [...imageMessageIds]
-    removedImageMessageIds.forEach((messageId) => discardedImageMessageIdsRef.current.add(messageId))
-    discardImageMessages(removedImageMessageIds)
+    discardTrackedImageMessages(
+      controller.state.conversations.flatMap((conversation) => conversation.messages),
+      [...imageMessageOwnersRef.current.keys()],
+      true,
+    )
     imageMessageOwnersRef.current.clear()
-    imageAttachmentCacheRef.current.clear()
     await controller.clearHistory()
-  }, [controller, discardImageMessages])
+  }, [controller, discardTrackedImageMessages])
 
   const attachmentWarning =
     attachmentError || (mode === "chat" && draftAttachments.length > 0 ? TEXT_ATTACHMENT_UNAVAILABLE : null)
@@ -679,7 +743,7 @@ function ChatWorkspace({ session }: { session: StoredAuthSession }) {
             onCopyError={(error) => toast.error(error instanceof Error ? error.message : "复制失败")}
             onEditAndResend={handleEditAndResend}
             onEditError={(error) => toast.error(error instanceof Error ? error.message : "重发失败")}
-            onRetry={(messageId) => void controller.retryAssistant(messageId)}
+            onRetry={(messageId) => void handleRetryAssistant(messageId)}
             onPreviewImage={openImagePreview}
             onDownloadImage={downloadImage}
             onUseImageAsReference={(image) => void handleUseImageAsReference(image)}

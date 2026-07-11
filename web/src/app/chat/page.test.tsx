@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { ImageSettings } from "@/app/image/components/image-settings"
-import type { ChatMessage } from "@/app/chat/lib/chat-types"
+import type { ChatConversation, ChatMessage } from "@/app/chat/lib/chat-types"
 
 const mocks = vi.hoisted(() => ({
   replace: vi.fn(),
@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   imageOptions: null as unknown,
   imageTasks: null as unknown,
   composerOptions: null as unknown,
+  threadOptions: null as unknown,
 }))
 
 vi.mock("next/navigation", () => ({
@@ -120,16 +121,24 @@ vi.mock("./components/chat-header", () => ({
 vi.mock("./components/chat-thread", () => ({
   ChatThread: ({
     onRetry,
+    onEditAndResend,
     onUseImageAsReference,
   }: {
     onRetry?: (id: string) => void
+    onEditAndResend?: (
+      id: string,
+      input: { text: string; attachmentIds: string[]; files: File[] },
+    ) => void | Promise<void>
     onUseImageAsReference?: (image: { id: string; url?: string }) => void
-  }) => (
-    <section>
-      <button type="button" onClick={() => onRetry?.("assistant-1")}>重新生成</button>
-      <button type="button" onClick={() => onUseImageAsReference?.({ id: "image-1", url: "/images/image-1.png" })}>用作参考图</button>
-    </section>
-  ),
+  }) => {
+    mocks.threadOptions = { onRetry, onEditAndResend, onUseImageAsReference }
+    return (
+      <section>
+        <button type="button" onClick={() => onRetry?.("assistant-1")}>重新生成</button>
+        <button type="button" onClick={() => onUseImageAsReference?.({ id: "image-1", url: "/images/image-1.png" })}>用作参考图</button>
+      </section>
+    )
+  },
 }))
 
 vi.mock("./components/chat-composer", () => ({
@@ -256,6 +265,54 @@ function controller() {
   }
 }
 
+function controllerWithBranch() {
+  const user: ChatMessage = {
+    id: "user-anchor",
+    role: "user",
+    text: "original prompt",
+    attachmentIds: [],
+    status: "complete",
+    createdAt: "2026-07-11T08:00:00.000Z",
+  }
+  const assistant: ChatMessage = {
+    id: "assistant-anchor",
+    role: "assistant",
+    text: "original answer",
+    attachmentIds: [],
+    status: "complete",
+    createdAt: "2026-07-11T08:01:00.000Z",
+  }
+  const image: ChatMessage = {
+    id: "image-tail",
+    role: "assistant",
+    text: "draw city",
+    attachmentIds: [],
+    status: "running",
+    createdAt: "2026-07-11T08:02:00.000Z",
+    images: [{ id: "tail-image", taskId: "tail-task", status: "running" }],
+  }
+  const conversation: ChatConversation = {
+    ...activeConversation,
+    messages: [user, assistant, image],
+  }
+  const next = controller() as unknown as {
+    state: {
+      conversations: ChatConversation[]
+      activeConversationId: string
+      [key: string]: unknown
+    }
+    activeConversation: ChatConversation
+    isStreaming: boolean
+    editAndResend: ReturnType<typeof vi.fn>
+    retryAssistant: ReturnType<typeof vi.fn>
+    upsertMessage: ReturnType<typeof vi.fn>
+  }
+  next.state.conversations = [conversation]
+  next.state.activeConversationId = conversation.id
+  next.activeConversation = conversation
+  return { controller: next, user, assistant, image }
+}
+
 function imageTasks() {
   return {
     activeTaskIds: [],
@@ -306,6 +363,7 @@ describe("ChatPage", () => {
     mocks.imageOptions = null
     mocks.controllerOptions = null
     mocks.composerOptions = null
+    mocks.threadOptions = null
     document.documentElement.classList.remove("dark")
   })
 
@@ -320,8 +378,10 @@ describe("ChatPage", () => {
       subjectId: "subject-user",
       authKey: "user-key",
     })
-    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).recoverImageMessages).toHaveBeenCalledWith(
-      activeConversation.messages,
+    await waitFor(() =>
+      expect((mocks.imageTasks as ReturnType<typeof imageTasks>).recoverImageMessages).toHaveBeenCalledWith(
+        activeConversation.messages,
+      ),
     )
 
     fireEvent.click(screen.getByRole("button", { name: "选择模型" }))
@@ -334,9 +394,7 @@ describe("ChatPage", () => {
     )
 
     fireEvent.click(screen.getByRole("button", { name: "停止" }))
-    fireEvent.click(screen.getByRole("button", { name: "重新生成" }))
     expect((mocks.controller as ReturnType<typeof controller>).stop).toHaveBeenCalledTimes(1)
-    expect((mocks.controller as ReturnType<typeof controller>).retryAssistant).toHaveBeenCalledWith("assistant-1")
 
     const imageMessage: ChatMessage = activeConversation.messages[0]
     const imageOptions = mocks.imageOptions as {
@@ -351,6 +409,9 @@ describe("ChatPage", () => {
       { conversationId: activeConversation.id },
     )
 
+    fireEvent.click(screen.getByRole("button", { name: "重新生成" }))
+    expect((mocks.controller as ReturnType<typeof controller>).retryAssistant).toHaveBeenCalledWith("assistant-1")
+
     fireEvent.click(screen.getByRole("button", { name: "删除对话" }))
     expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).toHaveBeenCalledWith(
       ["assistant-1"],
@@ -358,6 +419,11 @@ describe("ChatPage", () => {
     expect((mocks.controller as ReturnType<typeof controller>).deleteConversation).toHaveBeenCalledWith(
       activeConversation.id,
     )
+    ;(mocks.controller as ReturnType<typeof controller>).upsertMessage.mockClear()
+    await act(async () => {
+      await imageOptions.onMessageChange(imageMessage)
+    })
+    expect((mocks.controller as ReturnType<typeof controller>).upsertMessage).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole("button", { name: "切换主题" }))
     expect(document.documentElement.classList.contains("dark")).toBe(true)
@@ -618,6 +684,94 @@ describe("ChatPage", () => {
     expect(screen.getByTestId("composer-value")).toHaveTextContent("P")
   })
 
+  it("discards image tasks truncated by an edit before a delayed image update can revive them", async () => {
+    const branch = controllerWithBranch()
+    mocks.controller = branch.controller
+    render(<ChatPage />)
+
+    const thread = mocks.threadOptions as {
+      onEditAndResend: (
+        messageId: string,
+        input: { text: string; attachmentIds: string[]; files: File[] },
+      ) => Promise<void>
+    }
+    await act(async () => {
+      await thread.onEditAndResend("user-anchor", { text: "edited prompt", attachmentIds: [], files: [] })
+    })
+
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).toHaveBeenCalledWith([
+      branch.image.id,
+    ])
+    expect(branch.controller.editAndResend).toHaveBeenCalledWith("user-anchor", {
+      text: "edited prompt",
+      attachmentIds: [],
+    })
+
+    branch.controller.upsertMessage.mockClear()
+    const imageOptions = mocks.imageOptions as {
+      onMessageChange: (message: ChatMessage) => Promise<void>
+    }
+    await act(async () => {
+      await imageOptions.onMessageChange({
+        ...branch.image,
+        status: "complete",
+        images: [{ id: "tail-image", taskId: "tail-task", status: "success" }],
+      })
+    })
+    expect(branch.controller.upsertMessage).not.toHaveBeenCalled()
+  })
+
+  it("keeps branch image tasks when an edit cannot start because text is streaming", async () => {
+    const branch = controllerWithBranch()
+    branch.controller.isStreaming = true
+    mocks.controller = branch.controller
+    render(<ChatPage />)
+
+    const thread = mocks.threadOptions as {
+      onEditAndResend: (
+        messageId: string,
+        input: { text: string; attachmentIds: string[]; files: File[] },
+      ) => Promise<void>
+    }
+    await expect(
+      thread.onEditAndResend("user-anchor", { text: "edited prompt", attachmentIds: [], files: [] }),
+    ).rejects.toThrow("当前已有回复正在生成")
+
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).not.toHaveBeenCalled()
+    expect(branch.controller.editAndResend).not.toHaveBeenCalled()
+  })
+
+  it("discards image tasks truncated by an assistant retry and absorbs retries while streaming", async () => {
+    const branch = controllerWithBranch()
+    mocks.controller = branch.controller
+    render(<ChatPage />)
+
+    const thread = mocks.threadOptions as { onRetry: (messageId: string) => void | Promise<void> }
+    await act(async () => {
+      await thread.onRetry("assistant-anchor")
+    })
+
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).toHaveBeenCalledWith([
+      branch.image.id,
+    ])
+    expect(branch.controller.retryAssistant).toHaveBeenCalledWith("assistant-anchor")
+
+    const streamingBranch = controllerWithBranch()
+    streamingBranch.controller.isStreaming = true
+    mocks.controller = streamingBranch.controller
+    ;(mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages.mockClear()
+    render(<ChatPage />)
+    const streamingThread = mocks.threadOptions as { onRetry: (messageId: string) => void | Promise<void> }
+    await act(async () => {
+      await streamingThread.onRetry("assistant-anchor")
+    })
+
+    expect(streamingBranch.controller.retryAssistant).not.toHaveBeenCalled()
+    expect((mocks.imageTasks as ReturnType<typeof imageTasks>).discardImageMessages).not.toHaveBeenCalledWith([
+      streamingBranch.image.id,
+    ])
+  })
+
   it("restores image dimensions from the shared ratio and tier when older preferences omit them", async () => {
     saveChatImageSettings("subject-user", {
       ...IMAGE_SETTINGS,
@@ -679,6 +833,10 @@ describe("ChatPage", () => {
   })
 
   it("releases temporary image references after removal and after their first persistence", async () => {
+    const pendingSubmit = deferred<unknown>()
+    const tasks = imageTasks()
+    tasks.submit = vi.fn(() => pendingSubmit.promise)
+    mocks.imageTasks = tasks
     const reference = {
       id: "temporary-reference",
       name: "temporary.png",
@@ -725,23 +883,25 @@ describe("ChatPage", () => {
     await act(async () => {
       await imageOptions.onMessageChange(removedMessage)
     })
-    expect((mocks.controller as ReturnType<typeof controller>).upsertMessage).toHaveBeenLastCalledWith(
-      removedMessage,
-      [],
-      undefined,
-    )
+    expect((mocks.controller as ReturnType<typeof controller>).upsertMessage).not.toHaveBeenCalled()
 
     await act(async () => {
       await imageComposer.onFilesSelected([new File(["image"], "temporary.png", { type: "image/png" })])
     })
-    const persistedMessage = { ...removedMessage, id: "persisted-reference-message" }
+    act(() => {
+      ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("draw")
+    })
+    const submission = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    await waitFor(() => expect(tasks.submit).toHaveBeenCalledOnce())
+    const messageId = tasks.submit.mock.calls[0]?.[0]?.messageId as string
+    const persistedMessage = { ...removedMessage, id: messageId }
     await act(async () => {
       await imageOptions.onMessageChange(persistedMessage)
     })
     expect((mocks.controller as ReturnType<typeof controller>).upsertMessage).toHaveBeenLastCalledWith(
       persistedMessage,
-      [reference],
-      undefined,
+      [expect.objectContaining(reference)],
+      { conversationId: activeConversation.id },
     )
     await act(async () => {
       await imageOptions.onMessageChange({ ...persistedMessage, status: "running" })
@@ -749,7 +909,11 @@ describe("ChatPage", () => {
     expect((mocks.controller as ReturnType<typeof controller>).upsertMessage).toHaveBeenLastCalledWith(
       expect.objectContaining({ id: persistedMessage.id, status: "running" }),
       [],
-      undefined,
+      { conversationId: activeConversation.id },
     )
+    await act(async () => {
+      pendingSubmit.resolve({})
+      await submission
+    })
   })
 })
