@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any
 
@@ -9,7 +12,8 @@ import pytest
 from PIL import Image
 
 from services.chat_attachments import ChatAttachmentUploader
-from services.chat_types import ChatAttachmentBlob
+from services.chat_stream_service import ChatStreamSession
+from services.chat_types import ChatAttachmentBlob, ChatMessage, ChatStreamCommand
 from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 from utils.helper import UpstreamHTTPError
 
@@ -61,20 +65,74 @@ class _FakeSession:
 class _SignedUploadTransport:
     def __init__(self) -> None:
         self.responses: list[_FakeResponse] = []
-        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.sessions: list[_TransientUploadSession] = []
         self.error: Exception | None = None
+        self.block = False
+
+    def create_session(self, **kwargs: Any) -> _TransientUploadSession:
+        session = _TransientUploadSession(self, kwargs)
+        session.block = self.block
+        self.sessions.append(session)
+        return session
+
+    @property
+    def calls(self) -> list[tuple[str, dict[str, Any]]]:
+        return [
+            (url, kwargs)
+            for session in self.sessions
+            for method, url, kwargs in session.calls
+            if method == "put"
+        ]
+
+
+class _TransientUploadSession:
+    def __init__(self, transport: _SignedUploadTransport, session_kwargs: dict[str, Any]) -> None:
+        self.transport = transport
+        self.session_kwargs = session_kwargs
+        self.headers = {
+            "Authorization": "Bearer transient-credential",
+            "Cookie": "transient-cookie=secret",
+        }
+        self.cookies = {"transient-cookie": "secret"}
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.closed = False
+        self.close_calls = 0
+        self.started = threading.Event()
+        self.released = threading.Event()
+        self.block = False
+
+    def __enter__(self) -> _TransientUploadSession:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def request(self, method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        return self.put(url, method=method, **kwargs)
 
     def put(self, url: str, **kwargs: Any) -> _FakeResponse:
-        self.calls.append((url, kwargs))
-        if self.error is not None:
-            raise self.error
-        return self.responses.pop(0)
+        self.calls.append(("put", url, kwargs))
+        self.started.set()
+        if self.block:
+            self.released.wait(timeout=5)
+            if self.closed:
+                raise RuntimeError("signed upload session closed")
+        if self.transport.error is not None:
+            raise self.transport.error
+        return self.transport.responses.pop(0)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.close_calls += 1
+        self.released.set()
 
 
 @pytest.fixture
 def signed_upload(monkeypatch: pytest.MonkeyPatch) -> _SignedUploadTransport:
     transport = _SignedUploadTransport()
-    monkeypatch.setattr("services.openai_backend_api.requests.put", transport.put)
+    monkeypatch.setattr("services.openai_backend_api.requests.Session", transport.create_session)
     return transport
 
 
@@ -86,6 +144,10 @@ def _backend(responses: list[_FakeResponse]) -> tuple[OpenAIBackendAPI, _FakeSes
     backend.user_agent = "test-agent"
     backend.access_token = "test-token"
     backend._session_kwargs = {"impersonate": "chrome110", "verify": True}
+    backend._active_response_lock = threading.Lock()
+    backend._active_stream_response = None
+    backend._active_attachment_upload_sessions = {}
+    backend._closed = False
     return backend, session
 
 
@@ -115,6 +177,20 @@ def _png(width: int, height: int) -> bytes:
     return output.getvalue()
 
 
+class _SingleAccountProvider:
+    def get_text_access_token(self, _excluded_tokens: set[str] | None = None) -> str:
+        return "test-token"
+
+    def refresh_access_token(self, access_token: str, **_kwargs: Any) -> str:
+        return access_token
+
+    def remove_invalid_token(self, _access_token: str, _event: str, quiet: bool = False) -> bool:
+        return True
+
+    def mark_text_used(self, _access_token: str) -> None:
+        return None
+
+
 def test_document_upload_processes_before_conversation(
     signed_upload: _SignedUploadTransport,
 ) -> None:
@@ -122,11 +198,13 @@ def test_document_upload_processes_before_conversation(
         _FakeResponse(payload={
             "file_id": "file-secret",
             "upload_url": "https://upload.test/blob?sig=signed-secret",
-            "library_file_id": "library-secret",
+            "library_file_id": "creation-library-secret",
         }),
         _FakeResponse(payload={"status": "success"}),
         _FakeResponse(lines=[
-            b'data: {"event":"file.processing.completed","status":"success"}',
+            b'data: {"event":"file.processing.completed","status":"success",'
+            b'"extra":{"metadata_object_id":"processing-library-secret",'
+            b'"total_tokens":42,"mime_type":"application/processed-pdf"}}',
             b"data: [DONE]",
         ]),
     ])
@@ -140,10 +218,11 @@ def test_document_upload_processes_before_conversation(
             "metadata_attachment": {
                 "id": "file-secret",
                 "name": "sample.pdf",
-                "mime_type": "application/pdf",
+                "mime_type": "application/processed-pdf",
                 "size": 8,
                 "is_big_paste": False,
-                "library_file_id": "library-secret",
+                "library_file_id": "processing-library-secret",
+                "file_token_size": 42,
             },
         }
     }
@@ -158,6 +237,10 @@ def test_document_upload_processes_before_conversation(
         "mime_type": "application/pdf",
         "use_case": "multimodal",
     }
+    assert [item.session_kwargs for item in signed_upload.sessions] == [{
+        "impersonate": "chrome110",
+        "verify": True,
+    }]
     assert signed_upload.calls == [
         ("https://upload.test/blob?sig=signed-secret", {
             "headers": {
@@ -174,8 +257,6 @@ def test_document_upload_processes_before_conversation(
             "data": b"%PDF-1.7",
             "timeout": 120,
             "discard_cookies": True,
-            "impersonate": "chrome110",
-            "verify": True,
         }),
     ]
     assert session.calls[1][2]["data"] == "{}"
@@ -186,6 +267,116 @@ def test_document_upload_processes_before_conversation(
         "index_for_retrieval": True,
         "entry_surface": "composer",
     }
+
+
+def test_document_processing_metadata_does_not_fall_back_to_creation_id(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+            "library_file_id": "creation-library-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            b'data: {"event":"file.processing.completed","status":"success"}',
+            b"data: [DONE]",
+        ]),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    uploaded = backend.upload_chat_attachment_bytes(
+        b"%PDF-1.7",
+        "sample.pdf",
+        "application/pdf",
+        "document",
+    )
+
+    metadata = uploaded["metadata_attachment"]
+    assert "library_file_id" not in metadata
+    assert "file_token_size" not in metadata
+    assert metadata["mime_type"] == "application/pdf"
+
+
+def test_document_processing_merges_metadata_from_multiple_final_events(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            b'data: {"event":"file.processing.completed","status":"success",'
+            b'"extra":{"metadata_object_id":"processing-library-secret","total_tokens":42}}',
+            b'data: {"event":"file.processing.completed","status":"success",'
+            b'"extra":{"mime_type":"application/processed-pdf"}}',
+            b"data: [DONE]",
+        ]),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    uploaded = backend.upload_chat_attachment_bytes(
+        b"%PDF-1.7",
+        "sample.pdf",
+        "application/pdf",
+        "document",
+    )
+
+    assert uploaded["metadata_attachment"] == {
+        "id": "file-secret",
+        "name": "sample.pdf",
+        "mime_type": "application/processed-pdf",
+        "size": 8,
+        "is_big_paste": False,
+        "library_file_id": "processing-library-secret",
+        "file_token_size": 42,
+    }
+
+
+def test_chat_session_cancel_closes_blocking_attachment_upload(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, _main_session = _backend([_FakeResponse(payload={
+        "file_id": "file-secret",
+        "upload_url": "https://upload.test/blob?sig=signed-secret",
+    })])
+    signed_upload.block = True
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+    attachment = _attachment()
+    command = ChatStreamCommand(
+        model="gpt-5.5",
+        messages=(ChatMessage("message-1", "user", "Read the file.", (attachment.id,)),),
+        attachments=(attachment,),
+        thinking_effort="",
+    )
+    chat_session = ChatStreamSession(
+        command,
+        account_provider=_SingleAccountProvider(),
+        backend_factory=lambda _token: backend,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(lambda: list(chat_session))
+        try:
+            deadline = time.monotonic() + 1
+            while not signed_upload.sessions and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert signed_upload.sessions
+            upload_session = signed_upload.sessions[0]
+            assert upload_session.started.wait(timeout=1)
+            chat_session.cancel()
+            assert upload_session.closed
+            assert backend._closed
+            assert pending.result(timeout=1) == []
+        finally:
+            for upload_session in signed_upload.sessions:
+                upload_session.released.set()
+            chat_session.close()
+
+    assert signed_upload.sessions[0].close_calls == 1
 
 
 def test_image_upload_returns_asset_pointer_without_document_processing(
@@ -306,6 +497,11 @@ def test_signed_upload_does_not_send_account_credentials(
     assert "auth" not in signed_upload.calls[0][1]
     assert "cookies" not in signed_upload.calls[0][1]
     assert signed_upload.calls[0][1]["discard_cookies"] is True
+    upload_session = signed_upload.sessions[0]
+    assert "Authorization" not in upload_session.headers
+    assert "Cookie" not in upload_session.headers
+    assert upload_session.cookies == {}
+    assert upload_session.session_kwargs == {"impersonate": "chrome110", "verify": True}
 
 
 @pytest.mark.parametrize("status", ["complete", "finished", "finished_successfully"])
@@ -388,14 +584,9 @@ def test_document_processing_rejects_nested_failure_after_success(
     ],
 )
 def test_unsuccessful_creation_response_does_not_upload_or_return_pointer(
-    monkeypatch: pytest.MonkeyPatch,
+    signed_upload: _SignedUploadTransport,
     payload: dict[str, Any],
 ) -> None:
-    signed_calls: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "services.openai_backend_api.requests.put",
-        lambda url, **kwargs: signed_calls.append((url, kwargs)),
-    )
     backend, session = _backend([_FakeResponse(payload={
         "file_id": "file-secret",
         "upload_url": "https://upload.test/blob?sig=signed-secret",
@@ -408,10 +599,10 @@ def test_unsuccessful_creation_response_does_not_upload_or_return_pointer(
             "sample.pdf",
             "application/pdf",
             "document",
-        )
+    )
 
     assert captured.value.status_code == 502
-    assert signed_calls == []
+    assert signed_upload.sessions == []
     assert [method for method, _url, _kwargs in session.calls] == ["post"]
     assert "file-secret" not in str(captured.value)
     assert "signed-secret" not in str(captured.value)
@@ -476,6 +667,8 @@ def test_stream_attachment_payload_keeps_documents_in_metadata_only(
                     "mime_type": "application/pdf",
                     "size": 8,
                     "is_big_paste": False,
+                    "library_file_id": "processing-library-secret",
+                    "file_token_size": 42,
                 },
             },
             {
@@ -523,6 +716,8 @@ def test_stream_attachment_payload_keeps_documents_in_metadata_only(
                     "mime_type": "application/pdf",
                     "size": 8,
                     "is_big_paste": False,
+                    "library_file_id": "processing-library-secret",
+                    "file_token_size": 42,
                 },
                 {
                     "id": "image-file-secret",

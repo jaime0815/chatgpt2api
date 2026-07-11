@@ -356,6 +356,7 @@ class OpenAIBackendAPI:
         self.progress_callback: Callable[[str], None] | None = None
         self._active_response_lock = threading.Lock()
         self._active_stream_response: Any | None = None
+        self._active_attachment_upload_sessions: dict[int, Any] = {}
         self._closed = False
         self._session_kwargs = proxy_settings.build_session_kwargs(
             account=self.account,
@@ -395,10 +396,15 @@ class OpenAIBackendAPI:
     def close(self) -> None:
         lock = getattr(self, "_active_response_lock", None)
         response = None
+        upload_sessions: tuple[Any, ...] = ()
         if lock is None:
             if getattr(self, "_closed", False):
                 return
             self._closed = True
+            upload_sessions = tuple(
+                getattr(self, "_active_attachment_upload_sessions", {}).values()
+            )
+            self._active_attachment_upload_sessions = {}
         else:
             with lock:
                 if self._closed:
@@ -406,7 +412,13 @@ class OpenAIBackendAPI:
                 self._closed = True
                 response = self._active_stream_response
                 self._active_stream_response = None
+                upload_sessions = tuple(
+                    getattr(self, "_active_attachment_upload_sessions", {}).values()
+                )
+                self._active_attachment_upload_sessions = {}
         self._close_stream_response(response)
+        for upload_session in upload_sessions:
+            self._close_stream_response(upload_session)
         session = getattr(self, "session", None)
         if session:
             try:
@@ -421,10 +433,14 @@ class OpenAIBackendAPI:
         with lock:
             response = self._active_stream_response
             self._active_stream_response = None
-        if response is None:
-            return False
+            upload_sessions = tuple(
+                getattr(self, "_active_attachment_upload_sessions", {}).values()
+            )
+            self._active_attachment_upload_sessions = {}
         self._close_stream_response(response)
-        return True
+        for upload_session in upload_sessions:
+            self._close_stream_response(upload_session)
+        return response is not None or bool(upload_sessions)
 
     def _register_active_response(self, response: Any) -> bool:
         with self._active_response_lock:
@@ -441,6 +457,24 @@ class OpenAIBackendAPI:
                 return False
             self._active_stream_response = None
             return True
+
+    def _register_active_attachment_upload_session(self, session: Any) -> bool:
+        with self._active_response_lock:
+            if self._closed:
+                return False
+            upload_sessions = getattr(self, "_active_attachment_upload_sessions", None)
+            if not isinstance(upload_sessions, dict):
+                upload_sessions = {}
+                self._active_attachment_upload_sessions = upload_sessions
+            upload_sessions[id(session)] = session
+            return True
+
+    def _release_active_attachment_upload_session(self, session: Any) -> bool:
+        with self._active_response_lock:
+            upload_sessions = getattr(self, "_active_attachment_upload_sessions", None)
+            if not isinstance(upload_sessions, dict):
+                return False
+            return upload_sessions.pop(id(session), None) is session
 
     @staticmethod
     def _close_stream_response(response: Any | None) -> None:
@@ -1209,6 +1243,29 @@ class OpenAIBackendAPI:
         return session_kwargs
 
     @staticmethod
+    def _clear_chat_attachment_upload_credentials(session: Any) -> None:
+        headers = getattr(session, "headers", None)
+        if headers is not None:
+            for key in tuple(headers):
+                if str(key).lower() in {"authorization", "cookie"}:
+                    try:
+                        del headers[key]
+                    except (KeyError, TypeError):
+                        pass
+        cookies = getattr(session, "cookies", None)
+        clear = getattr(cookies, "clear", None)
+        if callable(clear):
+            try:
+                clear()
+            except Exception:
+                pass
+
+    def _new_chat_attachment_upload_session(self) -> Any:
+        session = requests.Session(**self._chat_attachment_signed_upload_kwargs())
+        self._clear_chat_attachment_upload_credentials(session)
+        return session
+
+    @staticmethod
     def _chat_attachment_semantics_ok(payload: Dict[str, Any], context: str) -> None:
         status_value = payload.get("status")
         status = str(status_value).strip().lower() if status_value is not None else ""
@@ -1252,6 +1309,25 @@ class OpenAIBackendAPI:
         return False
 
     @staticmethod
+    def _chat_attachment_processing_enrichment(event: Dict[str, Any]) -> Dict[str, Any]:
+        extra = event.get("extra")
+        sources = [extra, event] if isinstance(extra, dict) else [event]
+        enrichment: Dict[str, Any] = {}
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            library_file_id = source.get("metadata_object_id")
+            if isinstance(library_file_id, str) and library_file_id.strip():
+                enrichment["library_file_id"] = library_file_id.strip()
+            token_size = source.get("total_tokens")
+            if type(token_size) is int and token_size >= 0:
+                enrichment["file_token_size"] = token_size
+            mime_type = source.get("mime_type")
+            if isinstance(mime_type, str) and mime_type.strip():
+                enrichment["mime_type"] = mime_type.strip()
+        return enrichment
+
+    @staticmethod
     def _chat_attachment_request(context: str, request: Callable[[], Any]) -> Any:
         try:
             return request()
@@ -1260,7 +1336,7 @@ class OpenAIBackendAPI:
         except Exception:
             raise RuntimeError(f"{context} request failed") from None
 
-    def _process_chat_attachment_document(self, file_id: str, file_name: str) -> None:
+    def _process_chat_attachment_document(self, file_id: str, file_name: str) -> Dict[str, Any]:
         path = "/backend-api/files/process_upload_stream"
         response = self._chat_attachment_request(
             "chat attachment processing",
@@ -1287,6 +1363,7 @@ class OpenAIBackendAPI:
             completed = False
             done = False
             failed = False
+            enrichment: Dict[str, Any] = {}
             for payload in iter_sse_payloads(response):
                 if payload == "[DONE]":
                     done = True
@@ -1307,12 +1384,14 @@ class OpenAIBackendAPI:
                     and status in CHAT_ATTACHMENT_PROCESSING_SUCCESS_STATES
                 ):
                     completed = True
+                    enrichment.update(self._chat_attachment_processing_enrichment(event))
             if failed or not completed or not done:
                 raise UpstreamHTTPError(
                     "chat attachment processing",
                     502,
                     {"detail": "upstream attachment processing did not complete"},
                 )
+            return enrichment
         finally:
             self._close_stream_response(response)
 
@@ -1377,17 +1456,27 @@ class OpenAIBackendAPI:
         if not file_id or not upload_url:
             raise RuntimeError("invalid chat attachment creation response")
 
-        response = self._chat_attachment_request(
+        upload_session = self._chat_attachment_request(
             "chat attachment upload",
-            lambda: requests.put(
-                upload_url,
-                headers=self._chat_attachment_blob_headers(mime_type, len(data)),
-                data=data,
-                timeout=120,
-                discard_cookies=True,
-                **self._chat_attachment_signed_upload_kwargs(),
-            ),
+            self._new_chat_attachment_upload_session,
         )
+        if not self._register_active_attachment_upload_session(upload_session):
+            self._close_stream_response(upload_session)
+            raise RuntimeError("chat attachment upload cancelled")
+        try:
+            response = self._chat_attachment_request(
+                "chat attachment upload",
+                lambda: upload_session.put(
+                    upload_url,
+                    headers=self._chat_attachment_blob_headers(mime_type, len(data)),
+                    data=data,
+                    timeout=120,
+                    discard_cookies=True,
+                ),
+            )
+        finally:
+            self._release_active_attachment_upload_session(upload_session)
+            self._close_stream_response(upload_session)
         self._chat_attachment_response_ok(
             response,
             context="chat attachment upload",
@@ -1420,7 +1509,7 @@ class OpenAIBackendAPI:
             )
 
         if kind == "document":
-            self._process_chat_attachment_document(file_id, file_name)
+            processing_enrichment = self._process_chat_attachment_document(file_id, file_name)
             metadata_attachment: Dict[str, Any] = {
                 "id": file_id,
                 "name": file_name,
@@ -1428,9 +1517,7 @@ class OpenAIBackendAPI:
                 "size": len(data),
                 "is_big_paste": False,
             }
-            library_file_id = str(create_payload.get("library_file_id") or "")
-            if library_file_id:
-                metadata_attachment["library_file_id"] = library_file_id
+            metadata_attachment.update(processing_enrichment)
             return {
                 "kind": "document",
                 "metadata_attachment": metadata_attachment,
