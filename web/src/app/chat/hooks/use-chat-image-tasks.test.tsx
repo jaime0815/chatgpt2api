@@ -382,6 +382,10 @@ describe("useChatImageTasks", () => {
         expect.objectContaining({ status: "complete" }),
       ))
 
+      await act(async () => {
+        await result.current.recoverImageMessages([stale])
+      })
+
       expect(onMessageChange).toHaveBeenLastCalledWith(
         expect.objectContaining({ status: "complete" }),
       )
