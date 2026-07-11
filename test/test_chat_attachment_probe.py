@@ -73,7 +73,7 @@ def test_pdf_fixture_contains_complete_native_attachment_contract() -> None:
         and summary.get("message_status") == "finished_successfully"
     ]
     assert terminal_summaries
-    assert terminal_summaries[-1]["message_text"] == "sample.pdf"
+    assert terminal_summaries[-1]["message_matches_probe_file"] is True
 
     processing_status = fixture["processing_status"]
     assert processing_status
@@ -173,7 +173,8 @@ def _valid_sanitized_fixture() -> dict[str, Any]:
                 "done": True,
                 "events": [
                     {
-                        "event": "file.processing.metadata",
+                        "event": "file.processing.completed",
+                        "status": "success",
                         "progress": 100,
                         "extra": {
                             "mime_type": "application/pdf",
@@ -185,7 +186,7 @@ def _valid_sanitized_fixture() -> dict[str, Any]:
             },
         },
         "processing_status": [
-            {"stage": "process_upload_stream", "status": "file.processing.metadata", "progress": 100}
+            {"stage": "process_upload_stream", "status": "file.processing.completed", "progress": 100}
         ],
         "conversation": {
             "request": {"method": "POST", "path": "/backend-api/conversation"},
@@ -209,7 +210,7 @@ def _valid_sanitized_fixture() -> dict[str, Any]:
                         "message_role": "assistant",
                         "message_status": "finished_successfully",
                         "message_end_turn": True,
-                        "message_text": "sample.pdf",
+                        "message_matches_probe_file": True,
                     }
                 ],
             },
@@ -349,7 +350,7 @@ def _successful_conversation_summary(answer: str = "sample.pdf") -> dict[str, An
         "message_role": "assistant",
         "message_status": "finished_successfully",
         "message_end_turn": True,
-        "message_text": answer,
+        "message_matches_probe_file": answer == "sample.pdf",
     }
 
 
@@ -440,6 +441,64 @@ def test_processing_requires_success_terminal_and_complete_marker(
 
 
 @pytest.mark.parametrize(
+    ("prior_event", "failure_event"),
+    [
+        (
+            {"event": "file.processing.metadata", "progress": 100},
+            {"v": {"status": "blocked"}},
+        ),
+        (
+            {"event": "file.processing.completed", "status": "success", "progress": 100},
+            {"payload": {"error": {"code": "processing_failed"}}},
+        ),
+        (
+            {"event": "file.processing.completed", "status": "success", "progress": 100},
+            {"payload": {"state": "canceled"}},
+        ),
+    ],
+)
+def test_processing_nested_failure_stops_probe(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+    prior_event: dict[str, Any],
+    failure_event: dict[str, Any],
+) -> None:
+    result, stderr, raw_capture, fixture_path = _run_fake_probe(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        processing_events=[
+            prior_event,
+            failure_event,
+        ],
+    )
+
+    assert result == 1
+    assert "FAILED: stage=process_upload_stream" in stderr
+    assert raw_capture["failure"]["stage"] == "process_upload_stream"
+    assert not fixture_path.exists()
+
+
+def test_processing_metadata_without_explicit_success_terminal_stops_probe(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    result, stderr, raw_capture, fixture_path = _run_fake_probe(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        processing_events=[{"event": "file.processing.metadata", "progress": 100}],
+    )
+
+    assert result == 1
+    assert "FAILED: stage=process_upload_stream" in stderr
+    assert raw_capture["failure"]["stage"] == "process_upload_stream"
+    assert not fixture_path.exists()
+
+
+@pytest.mark.parametrize(
     ("processing_done", "expected_error"),
     [
         (False, "complete marker"),
@@ -459,6 +518,31 @@ def test_validator_requires_processing_semantic_completion(
     fixture["processing"]["response"]["done"] = processing_done
 
     with pytest.raises(ProbeFailed, match=expected_error):
+        _validate_fixture(fixture)
+
+
+def test_validator_requires_explicit_processing_success_terminal() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["processing"]["response"]["events"] = [
+        {"event": "file.processing.metadata", "progress": 100}
+    ]
+
+    with pytest.raises(ProbeFailed, match="successful terminal"):
+        _validate_fixture(fixture)
+
+
+def test_validator_rejects_processing_failure_after_success_terminal() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["processing"]["response"]["events"] = [
+        {"event": "file.processing.completed", "status": "success"},
+        {"status": "blocked"},
+    ]
+
+    with pytest.raises(ProbeFailed, match="terminal failure"):
         _validate_fixture(fixture)
 
 
@@ -540,6 +624,66 @@ def test_validator_requires_conversation_semantic_completion(
     fixture["conversation"]["response"]["event_summaries"] = event_summaries
 
     with pytest.raises(ProbeFailed, match=expected_error):
+        _validate_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ("assistant_text", "matches_probe_file"),
+    [
+        ("sample.pdf", True),
+        ("customer email: alice@example.invalid", False),
+    ],
+)
+def test_event_summary_keeps_only_safe_probe_answer_decision(
+    assistant_text: str,
+    matches_probe_file: bool,
+) -> None:
+    from scripts.probe_chat_file_attachment import _event_summary
+
+    summary = _event_summary(
+        {
+            "message": {
+                "author": {"role": "assistant"},
+                "status": "finished_successfully",
+                "end_turn": True,
+                "content": {"content_type": "text", "parts": [assistant_text]},
+            }
+        },
+        {},
+    )
+
+    assert "message_text" not in summary
+    assert summary["message_matches_probe_file"] is matches_probe_file
+    assert assistant_text not in json.dumps(summary)
+
+
+def test_validator_accepts_safe_probe_answer_decision() -> None:
+    from scripts.probe_chat_file_attachment import _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+
+    _validate_fixture(fixture)
+
+
+def test_validator_rejects_legacy_assistant_text_even_when_it_matches_probe() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["conversation"]["response"]["event_summaries"][0]["message_text"] = "sample.pdf"
+
+    with pytest.raises(ProbeFailed, match="unexpected fields"):
+        _validate_fixture(fixture)
+
+
+def test_validator_rejects_non_boolean_probe_answer_decision() -> None:
+    from scripts.probe_chat_file_attachment import ProbeFailed, _validate_fixture
+
+    fixture = _valid_sanitized_fixture()
+    fixture["conversation"]["response"]["event_summaries"][0][
+        "message_matches_probe_file"
+    ] = "customer email: alice@example.invalid"
+
+    with pytest.raises(ProbeFailed, match="message_matches_probe_file"):
         _validate_fixture(fixture)
 
 
@@ -739,7 +883,8 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                         "trace_id": "trace_opaque/+/identifier==",
                     },
                     {
-                        "event": "file.processing.metadata",
+                        "event": "file.processing.completed",
+                        "status": "success",
                         "progress": 100,
                         "extra": {
                             "mime_type": "application/pdf",
@@ -794,6 +939,20 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
                         "conversation_id": "conversation-real-secret",
                         "request_id": "req_conversation/+/opaque==",
                         "message": {
+                            "id": "reply-intermediate-secret",
+                            "author": {"role": "assistant"},
+                            "status": "in_progress",
+                            "end_turn": False,
+                            "content": {
+                                "content_type": "text",
+                                "parts": ["customer email: alice@example.invalid"],
+                            },
+                        },
+                    },
+                    {
+                        "conversation_id": "conversation-real-secret",
+                        "request_id": "req_conversation/+/opaque==",
+                        "message": {
                             "id": "reply-real-secret",
                             "author": {"role": "assistant"},
                             "status": "finished_successfully",
@@ -817,7 +976,7 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
     assert fixture["conversation"]["metadata_attachment"]["sha256"] == FIXTURE_SHA256
     assert [item["status"] for item in fixture["processing_status"]] == [
         "file.processing.started",
-        "file.processing.metadata",
+        "file.processing.completed",
     ]
     assert "file-real-secret" not in serialized
     assert "conversation-real-secret" not in serialized
@@ -829,8 +988,14 @@ def test_sanitizer_replaces_live_identifiers_and_signed_upload_url() -> None:
     assert "gcs-secret-value" not in serialized
     assert "processing-session-secret" not in serialized
     assert "attachment-auth-secret" not in serialized
+    assert "alice@example.invalid" not in serialized
     assert "sessionToken" not in _all_keys(fixture)
     assert "auth_token" not in _all_keys(fixture)
+    assert (
+        fixture["conversation"]["response"]["event_summaries"][-2]["message_matches_probe_file"]
+        is False
+    )
+    assert fixture["conversation"]["response"]["event_summaries"][-1]["message_matches_probe_file"] is True
     persistence_reason = fixture["processing"]["response"]["events"][1]["extra"][
         "library_persistence_reason"
     ]

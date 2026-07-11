@@ -178,6 +178,7 @@ ALLOWED_SHA256_PATHS = {
     ("conversation", "metadata_attachment", "sha256"),
 }
 PROCESSING_TERMINAL_FAILURES = {
+    "blocked",
     "error",
     "failed",
     "failure",
@@ -190,10 +191,12 @@ PROCESSING_TERMINAL_SUCCESSES = {
     "completed",
     "finished",
     "finished_successfully",
-    "metadata",
     "succeeded",
     "success",
 }
+PROCESSING_STATE_FIELDS = {"event", "outcome", "phase", "result", "state", "status", "type"}
+PROCESSING_ERROR_FIELDS = {"error", "errors", "error_code", "file_parse_error_code"}
+PROCESSING_FAILURE_FLAG_FIELDS = {"blocked", "canceled", "cancelled", "failed", "failure"}
 CONVERSATION_TERMINAL_SUCCESSES = {
     "complete",
     "completed",
@@ -540,18 +543,62 @@ def _processing_state_is_success(value: Any) -> bool:
     return bool(normalized) and normalized.rsplit(".", 1)[-1] in PROCESSING_TERMINAL_SUCCESSES
 
 
+def _processing_error_is_present(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (dict, list, tuple, set)):
+        return bool(value)
+    return True
+
+
+def _processing_event_has_state(
+    value: Any,
+    predicate: Callable[[Any], bool],
+    *,
+    inside_extra: bool = False,
+) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized_key = str(key).strip().lower()
+            if not inside_extra and normalized_key in PROCESSING_STATE_FIELDS and predicate(nested):
+                return True
+            if _processing_event_has_state(
+                nested,
+                predicate,
+                inside_extra=inside_extra or normalized_key == "extra",
+            ):
+                return True
+    elif isinstance(value, list):
+        return any(
+            _processing_event_has_state(item, predicate, inside_extra=inside_extra)
+            for item in value
+        )
+    return False
+
+
 def _processing_event_has_failure(event: Any) -> bool:
-    return isinstance(event, dict) and any(
-        _processing_state_is_failure(event.get(key))
-        for key in ("event", "status")
-    )
+    if not isinstance(event, (dict, list)):
+        return False
+    if _processing_event_has_state(event, _processing_state_is_failure):
+        return True
+    if isinstance(event, dict):
+        for key, value in event.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key in PROCESSING_ERROR_FIELDS and _processing_error_is_present(value):
+                return True
+            if normalized_key in PROCESSING_FAILURE_FLAG_FIELDS and _processing_error_is_present(value):
+                return True
+            if _processing_event_has_failure(value):
+                return True
+    elif isinstance(event, list):
+        return any(_processing_event_has_failure(item) for item in event)
+    return False
 
 
 def _processing_event_has_success(event: Any) -> bool:
-    return isinstance(event, dict) and any(
-        _processing_state_is_success(event.get(key))
-        for key in ("event", "status")
-    )
+    return _processing_event_has_state(event, _processing_state_is_success)
 
 
 def _response_body_has_semantic_failure(value: Any) -> bool:
@@ -684,7 +731,7 @@ def _event_summary(event: dict[str, Any], replacements: dict[str, str]) -> dict[
             summary["message_status"] = _redact_string(terminal_status, replacements)
         message_text = _message_text(message)
         if message_text:
-            summary["message_text"] = _redact_string(message_text, replacements)
+            summary["message_matches_probe_file"] = message_text.strip() == PROBE_FILE_NAME
     return summary
 
 
@@ -1354,7 +1401,7 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
                 "message_recipient",
                 "message_role",
                 "message_end_turn",
-                "message_text",
+                "message_matches_probe_file",
                 "has_error",
             },
             required=set(),
@@ -1372,6 +1419,11 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
             "<message-id-redacted>",
             f"conversation.response.event_summaries[{index}]",
         )
+        if "message_matches_probe_file" in summary_mapping:
+            _require_fixture(
+                isinstance(summary_mapping["message_matches_probe_file"], bool),
+                f"conversation.response.event_summaries[{index}].message_matches_probe_file",
+            )
         if summary_mapping.get("has_error") is True or any(
             _processing_state_is_failure(summary_mapping.get(key))
             for key in ("type", "event", "status", "message_status")
@@ -1385,13 +1437,13 @@ def _validate_fixture(fixture: dict[str, Any]) -> None:
             in CONVERSATION_TERMINAL_SUCCESSES
             and summary_mapping.get("message_end_turn") is not False
         ):
-            successful_answers.append(str(summary_mapping.get("message_text") or "").strip())
+            successful_answers.append(summary_mapping.get("message_matches_probe_file") is True)
     _require_fixture(
         bool(successful_answers),
         "conversation.response successful assistant terminal",
     )
     _require_fixture(
-        successful_answers[-1] == PROBE_FILE_NAME,
+        successful_answers[-1] is True,
         "conversation.response probe answer",
     )
 
