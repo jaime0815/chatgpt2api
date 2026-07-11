@@ -761,9 +761,12 @@ describe("ChatPage", () => {
       imageComposer.onValueChange("P")
     })
 
-    const submit = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    let submit!: Promise<void>
+    act(() => {
+      submit = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    })
     await waitFor(() => expect(tasks.submit).toHaveBeenCalledOnce())
-    expect(screen.getByTestId("composer-disabled")).toHaveTextContent("true")
+    await waitFor(() => expect(screen.getByTestId("composer-disabled")).toHaveTextContent("true"))
 
     act(() => {
       ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("Q")
