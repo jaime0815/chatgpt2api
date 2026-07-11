@@ -200,6 +200,8 @@ Linux/macOS 以 `:` 分隔 `LIVE_CHAT_IMAGE_FILES`，Windows 使用 `;`。该 li
 Authorization: Bearer <auth-key>
 ```
 
+下列图片接口示例中的 `<image-model>` 请替换为该环境 `GET /v1/models` 返回且实际可用的模型 ID。
+
 ### `GET /v1/models`
 
 返回当前上游发现的模型目录。使用 `?refresh=1` 表达显式刷新，响应带 `Cache-Control: no-store`。返回目录会随账号和上游变化，不再在文档中维护静态模型名列表。
@@ -218,7 +220,7 @@ curl http://localhost:8000/chatgpt2api/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "<image-model>",
     "prompt": "一只漂浮在太空里的猫",
     "n": 1,
     "response_format": "b64_json"
@@ -239,7 +241,7 @@ curl http://localhost:8000/chatgpt2api/v1/images/generations \
 ```bash
 curl http://localhost:8000/chatgpt2api/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
-  -F "model=gpt-image-2" \
+  -F "model=<image-model>" \
   -F "prompt=把这张图改成赛博朋克夜景风格" \
   -F "n=1" \
   -F "image=@./input.png"
@@ -252,7 +254,7 @@ curl http://localhost:8000/chatgpt2api/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "<image-model>",
     "prompt": "把这张图改成赛博朋克夜景风格",
     "images": [{"image_url": "https://example.com/input.png"}]
   }'
