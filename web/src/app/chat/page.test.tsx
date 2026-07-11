@@ -789,9 +789,12 @@ describe("ChatPage", () => {
     act(() => {
       ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("P")
     })
-    const send = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    let send!: Promise<void>
+    act(() => {
+      send = (mocks.composerOptions as { onSubmit: () => Promise<void> }).onSubmit()
+    })
     await waitFor(() => expect(textController.sendText).toHaveBeenCalledWith({ text: "P" }))
-    expect(screen.getByTestId("composer-value")).toBeEmptyDOMElement()
+    await waitFor(() => expect(screen.getByTestId("composer-value")).toBeEmptyDOMElement())
 
     act(() => {
       ;(mocks.composerOptions as { onValueChange: (value: string) => void }).onValueChange("Q")
