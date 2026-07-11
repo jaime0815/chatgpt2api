@@ -110,6 +110,29 @@ describe("chat image helpers", () => {
     ).toBe("running")
   })
 
+  it("does not downgrade a terminal image from a delayed running task response", () => {
+    const message: ChatMessage = {
+      id: "assistant-terminal",
+      role: "assistant",
+      text: "",
+      attachmentIds: [],
+      status: "complete",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      images: [
+        {
+          id: "image-terminal",
+          taskId: "task-terminal",
+          status: "success",
+          url: "/images/already-complete.png",
+        },
+      ],
+    }
+
+    expect(
+      applyImageTaskToChatMessage(message, imageTask({ id: "task-terminal", status: "running" })),
+    ).toEqual(message)
+  })
+
   it("fetches a persisted image URL as a File for a later edit", async () => {
     const fetchImpl = vi.fn(async () =>
       ({

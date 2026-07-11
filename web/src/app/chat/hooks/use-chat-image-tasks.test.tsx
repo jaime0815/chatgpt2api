@@ -99,7 +99,13 @@ describe("useChatImageTasks", () => {
     expect(message).toMatchObject({
       role: "assistant",
       status: "queued",
-      imageSettings: { ...SETTINGS, count: 3, mode: "edit" },
+      attachmentIds: ["reference"],
+      imageSettings: {
+        ...SETTINGS,
+        count: 3,
+        mode: "edit",
+        referenceAttachmentIds: ["reference"],
+      },
       images: [
         { status: "queued" },
         { status: "queued" },
@@ -215,6 +221,117 @@ describe("useChatImageTasks", () => {
       "1536x1024",
       SETTINGS.quality,
     )
+  })
+
+  it("restores persisted reference attachments before retrying an edit turn", async () => {
+    const dependencies = createDependencies()
+    const resolveAttachments = vi.fn(async () => [reference("stored-reference")])
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const message: ChatMessage = {
+      id: "assistant-edit-retry",
+      role: "assistant",
+      text: "",
+      attachmentIds: ["stored-reference"],
+      status: "error",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      imageSettings: {
+        ...SETTINGS,
+        count: 1,
+        mode: "edit",
+        referenceAttachmentIds: ["stored-reference"],
+      },
+      images: [{ id: "failed-edit", taskId: "old-edit-task", status: "error", error: "生成失败" }],
+    }
+    const { result } = renderHook(() =>
+      useChatImageTasks({
+        onMessageChange,
+        dependencies,
+        pollIntervalMs: 0,
+        resolveAttachments,
+      }),
+    )
+
+    await act(async () => {
+      await result.current.retryImageTask(message, "failed-edit", { prompt: "retry edit" })
+    })
+
+    await waitFor(() => expect(onMessageChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ status: "complete" }),
+    ))
+    expect(resolveAttachments).toHaveBeenCalledWith(["stored-reference"])
+    expect(dependencies.createImageEditTask).toHaveBeenCalledOnce()
+  })
+
+  it("keeps fulfilled tasks running when another task in the same batch fails to submit", async () => {
+    const dependencies = createDependencies()
+    let submissions = 0
+    let failedTaskId = ""
+    dependencies.createImageGenerationTask = vi.fn(async (taskId) => {
+      submissions += 1
+      if (submissions === 2) {
+        failedTaskId = taskId
+        throw new Error("second submission failed")
+      }
+      return task(taskId, "running")
+    })
+    dependencies.fetchImageTasks = vi.fn(async (ids: string[]) => ({
+      items: ids.filter((id) => id !== failedTaskId).map((id) => task(id, "success")),
+      missing_ids: ids.filter((id) => id === failedTaskId),
+    }))
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    await act(async () => {
+      await result.current.submit({ prompt: "draw three", settings: SETTINGS })
+    })
+
+    await waitFor(() => expect(onMessageChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        images: expect.arrayContaining([
+          expect.objectContaining({ status: "success" }),
+          expect.objectContaining({ status: "error" }),
+        ]),
+      }),
+    ))
+    const finalMessage = onMessageChange.mock.calls.at(-1)?.[0] as ChatMessage
+    expect(finalMessage.images?.filter((image) => image.status === "success")).toHaveLength(2)
+    expect(finalMessage.images?.filter((image) => image.status === "error")).toHaveLength(1)
+  })
+
+  it("continues refresh recovery after a transient task-list failure", async () => {
+    const dependencies = createDependencies()
+    let calls = 0
+    dependencies.fetchImageTasks = vi.fn(async (ids: string[]) => {
+      calls += 1
+      if (calls === 1) {
+        throw new Error("temporary network failure")
+      }
+      return { items: ids.map((id) => task(id, "success")), missing_ids: [] }
+    })
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const existing: ChatMessage = {
+      id: "assistant-transient",
+      role: "assistant",
+      text: "",
+      attachmentIds: [],
+      status: "running",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      images: [{ id: "image-transient", taskId: "transient-task", status: "running" }],
+    }
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    await act(async () => {
+      await result.current.recoverImageMessages([existing])
+    })
+
+    await waitFor(() => expect(onMessageChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ status: "complete" }),
+    ))
+    expect(dependencies.fetchImageTasks).toHaveBeenCalledTimes(2)
   })
 
   it("rejects documents and more than ten reference images before submitting a task", async () => {

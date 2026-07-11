@@ -23,6 +23,7 @@ function asImageTaskStatus(status: ImageTask["status"]): ChatGeneratedImage["sta
 export function chatImageSettingsSnapshot(
   settings: ImageSettings,
   mode: ChatImageSettingsSnapshot["mode"] = "generate",
+  referenceAttachmentIds: readonly string[] = [],
 ): ChatImageSettingsSnapshot {
   return {
     mode,
@@ -33,6 +34,9 @@ export function chatImageSettingsSnapshot(
     ratio: settings.ratio,
     tier: settings.tier,
     count: Math.min(100, Math.max(1, Math.floor(Number(settings.count) || 1))),
+    ...(referenceAttachmentIds.length > 0
+      ? { referenceAttachmentIds: [...new Set(referenceAttachmentIds)] }
+      : {}),
   }
 }
 
@@ -80,10 +84,15 @@ export function applyImageTaskToChatMessage(message: ChatMessage, task: ImageTas
   const successfulImages = taskImageToChatImage(task)
   const dimensions = imageDimensions(task.size)
   let successfulIndex = 0
+  let changed = false
   const nextImages = images.map((image) => {
     if (image.taskId !== task.id) {
       return image
     }
+    if (image.status === "success" || image.status === "error") {
+      return image
+    }
+    changed = true
     if (task.status === "success") {
       const result = successfulImages[successfulIndex]
       successfulIndex += 1
@@ -119,6 +128,9 @@ export function applyImageTaskToChatMessage(message: ChatMessage, task: ImageTas
       ...dimensions,
     }
   })
+  if (!changed) {
+    return message
+  }
   const status = chatImageMessageStatus(nextImages)
   return {
     ...message,

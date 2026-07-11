@@ -58,6 +58,7 @@ export type ChatImageSettingsSnapshot = {
   ratio: string
   tier: string
   count: number
+  referenceAttachmentIds?: string[]
 }
 
 export type ChatGeneratedImage = {

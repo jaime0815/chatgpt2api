@@ -68,6 +68,9 @@ export type UseChatImageTasksOptions = {
   onMessageChange: (message: ChatMessage) => void | Promise<void>
   dependencies?: Partial<ChatImageTaskDependencies>
   pollIntervalMs?: number
+  resolveAttachments?: (
+    attachmentIds: readonly string[],
+  ) => Promise<readonly PreparedChatAttachment[]>
 }
 
 function imageSize(snapshot: ChatImageSettingsSnapshot) {
@@ -94,6 +97,10 @@ function validateReferences(references: readonly PreparedChatAttachment[]) {
   if (references.length > MAX_REFERENCE_IMAGES) {
     throw new Error(`一次最多使用 ${MAX_REFERENCE_IMAGES} 张参考图`)
   }
+}
+
+function uniqueAttachmentIds(references: readonly PreparedChatAttachment[]) {
+  return [...new Set(references.map((reference) => reference.id).filter(Boolean))]
 }
 
 function pendingImage(taskId: string): ChatGeneratedImage {
@@ -163,6 +170,7 @@ export function useChatImageTasks({
   onMessageChange,
   dependencies,
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+  resolveAttachments,
 }: UseChatImageTasksOptions) {
   const dependenciesRef = useRef<ChatImageTaskDependencies>({
     ...DEFAULT_DEPENDENCIES,
@@ -172,6 +180,7 @@ export function useChatImageTasks({
   const onMessageChangeRef = useRef(onMessageChange)
   onMessageChangeRef.current = onMessageChange
   const messagesRef = useRef(new Map<string, ChatMessage>())
+  const pollersRef = useRef(new Map<string, Promise<void>>())
   const disposedRef = useRef(false)
   const [activeTaskIds, setActiveTaskIds] = useState<string[]>([])
 
@@ -248,6 +257,23 @@ export function useChatImageTasks({
     [emit, pollIntervalMs],
   )
 
+  const ensurePolling = useCallback(
+    (messageId: string) => {
+      const existing = pollersRef.current.get(messageId)
+      if (existing) {
+        return existing
+      }
+      const poller = pollMessage(messageId).finally(() => {
+        if (pollersRef.current.get(messageId) === poller) {
+          pollersRef.current.delete(messageId)
+        }
+      })
+      pollersRef.current.set(messageId, poller)
+      return poller
+    },
+    [pollMessage],
+  )
+
   const runPendingTasks = useCallback(
     async (
       messageId: string,
@@ -261,7 +287,7 @@ export function useChatImageTasks({
         if (settings.mode === "edit" && referenceFiles.length === 0) {
           throw new Error("未找到可用于编辑的参考图")
         }
-        const submitted = await Promise.all(
+        const submitted = await Promise.allSettled(
           placeholderIds.map(async (placeholderId) => {
             const taskId = messagesRef.current
               .get(messageId)
@@ -293,15 +319,21 @@ export function useChatImageTasks({
         if (!next || disposedRef.current) {
           return
         }
-        for (const result of submitted) {
-          if (!result) {
+        for (let index = 0; index < submitted.length; index += 1) {
+          const result = submitted[index]
+          const placeholderId = placeholderIds[index]
+          if (!placeholderId || !result) {
             continue
           }
-          const linked = replaceMessageImageTaskId(next, result.placeholderId, result.task)
-          next = applyImageTaskToChatMessage(linked, result.task)
+          if (result.status === "rejected" || !result.value) {
+            // Leave the client task ID pending so polling can discover a request that reached the server.
+            continue
+          }
+          const linked = replaceMessageImageTaskId(next, result.value.placeholderId, result.value.task)
+          next = applyImageTaskToChatMessage(linked, result.value.task)
         }
         await emit(next)
-        await pollMessage(messageId)
+        await ensurePolling(messageId)
       } catch (error) {
         const current = messagesRef.current.get(messageId)
         if (current && !disposedRef.current) {
@@ -309,7 +341,7 @@ export function useChatImageTasks({
         }
       }
     },
-    [emit, pollMessage],
+    [emit, ensurePolling],
   )
 
   const submit = useCallback(
@@ -321,14 +353,19 @@ export function useChatImageTasks({
       const references = [...(input.references || [])]
       validateReferences(references)
       const mode: ChatImageSettingsSnapshot["mode"] = references.length > 0 ? "edit" : "generate"
-      const settings = chatImageSettingsSnapshot(normalizeImageSettings(input.settings), mode)
+      const referenceAttachmentIds = uniqueAttachmentIds(references)
+      const settings = chatImageSettingsSnapshot(
+        normalizeImageSettings(input.settings),
+        mode,
+        referenceAttachmentIds,
+      )
       const messageId = input.messageId || dependenciesRef.current.createId()
       const taskIds = Array.from({ length: settings.count }, () => dependenciesRef.current.createId())
       const message: ChatMessage = {
         id: messageId,
         role: "assistant",
         text: "",
-        attachmentIds: [],
+        attachmentIds: referenceAttachmentIds,
         status: "queued",
         createdAt: dependenciesRef.current.now().toISOString(),
         imageSettings: settings,
@@ -366,28 +403,37 @@ export function useChatImageTasks({
           }
           nextMessages.push(await emit(next))
           if (pendingTaskIds(next).length > 0) {
-            void pollMessage(next.id)
+            void ensurePolling(next.id)
           }
         }
         return nextMessages
       } catch {
-        return []
+        for (const message of pending) {
+          void ensurePolling(message.id)
+        }
+        return pending
       }
     },
-    [emit, pollMessage],
+    [emit, ensurePolling],
   )
 
   const resumeImageTask = useCallback(
     async (message: ChatMessage, taskId: string) => {
       messagesRef.current.set(message.id, message)
       const task = await dependenciesRef.current.resumeImagePoll(taskId)
-      const next = await emit(applyImageTaskToChatMessage(message, task))
+      const resumed: ChatMessage = {
+        ...message,
+        images: (message.images || []).map((image) =>
+          image.taskId === taskId ? { ...image, status: "running" as const, error: undefined } : image,
+        ),
+      }
+      const next = await emit(applyImageTaskToChatMessage(resumed, task))
       if (pendingTaskIds(next).length > 0) {
-        await pollMessage(next.id)
+        await ensurePolling(next.id)
       }
       return messagesRef.current.get(next.id) || next
     },
-    [emit, pollMessage],
+    [emit, ensurePolling],
   )
 
   const retryImageTask = useCallback(
@@ -400,17 +446,27 @@ export function useChatImageTasks({
       if (!prompt) {
         throw new Error("图片提示词不能为空")
       }
-      const references = [...(input.references || [])]
-      validateReferences(references)
       const snapshot = message.imageSettings
       if (!snapshot) {
         throw new Error("缺少图片生成参数，无法重试")
       }
+      const savedReferenceIds = snapshot.referenceAttachmentIds || message.attachmentIds
+      const references = input.references?.length
+        ? [...input.references]
+        : savedReferenceIds.length > 0 && resolveAttachments
+          ? [...(await resolveAttachments(savedReferenceIds))]
+          : []
+      validateReferences(references)
       const mode: ChatImageSettingsSnapshot["mode"] = references.length > 0 ? "edit" : snapshot.mode
-      const settings = chatImageSettingsSnapshot(snapshotToSettings(snapshot), mode)
+      const settings = chatImageSettingsSnapshot(
+        snapshotToSettings(snapshot),
+        mode,
+        uniqueAttachmentIds(references),
+      )
       const taskId = dependenciesRef.current.createId()
       const next: ChatMessage = {
         ...message,
+        attachmentIds: uniqueAttachmentIds(references),
         imageSettings: settings,
         status: "queued",
         error: undefined,
@@ -422,7 +478,7 @@ export function useChatImageTasks({
       void runPendingTasks(next.id, prompt, settings, references, [imageId])
       return next
     },
-    [emit, runPendingTasks],
+    [emit, resolveAttachments, runPendingTasks],
   )
 
   return {
