@@ -112,7 +112,7 @@ export function TopNav() {
 
   const navItems = session.role === "admin" ? adminNavItems : userNavItems;
   const roleLabel = session.role === "admin" ? "管理员" : "普通用户";
-  const brandName = session.role === "user" ? "ChatCanvas" : "ChatGPT2API";
+  const brandName = "ChatCanvas";
   const displayName = session.name.trim() || roleLabel;
   const baseUrl = getApiBaseUrl(window.location.origin);
   const canvas = thirdPartyApps?.infinite_canvas;

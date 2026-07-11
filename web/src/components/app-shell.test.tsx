@@ -111,8 +111,8 @@ describe("AppShell", () => {
     const { container } = renderShell("/accounts");
 
     await waitFor(() => expect(container.querySelector("header")).toBeInTheDocument());
-    expect(screen.getAllByText("ChatGPT2API").length).toBeGreaterThan(0);
-    expect(screen.queryByText("ChatCanvas")).not.toBeInTheDocument();
+    expect(screen.getAllByText("ChatCanvas").length).toBeGreaterThan(0);
+    expect(screen.queryByText("ChatGPT2API")).not.toBeInTheDocument();
     expect(container.querySelector("main")).toHaveClass("min-h-screen", "px-4");
     expect(screen.getAllByRole("link", { name: "号池管理" }).length).toBeGreaterThan(0);
     expect(screen.queryByRole("link", { name: "聊天" })).not.toBeInTheDocument();
