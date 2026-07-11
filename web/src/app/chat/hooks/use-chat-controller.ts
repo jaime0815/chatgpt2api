@@ -667,42 +667,79 @@ export function useChatController({ subjectId, dependencies }: UseChatController
   )
 
   const saveNewAttachments = useCallback(
-    async (attachments: readonly PreparedChatAttachment[]) => {
+    async (run: ActiveRun, attachments: readonly PreparedChatAttachment[]) => {
       const unique = uniqueAttachments(attachments)
       for (const attachment of unique) {
+        if (!activeRunConversation(run)) {
+          return
+        }
         attachmentCacheRef.current.set(attachment.id, attachment)
+        if (!activeRunConversation(run)) {
+          return
+        }
         const stored = await attemptStorageWrite(() =>
-          dependenciesRef.current.saveAttachment(subjectId, attachment),
+          dependenciesRef.current.saveAttachment(run.subjectId, attachment),
         )
+        if (!activeRunConversation(run)) {
+          return
+        }
         if (stored.ok) {
+          if (!activeRunConversation(run)) {
+            return
+          }
           attachmentCacheRef.current.set(stored.value.id, stored.value)
         }
       }
-      return unique
     },
-    [attemptStorageWrite, subjectId],
+    [activeRunConversation, attemptStorageWrite],
   )
 
   const resolveReferencedAttachments = useCallback(
-    async (messages: readonly ChatMessage[]) => {
+    async (run: ActiveRun, messages: readonly ChatMessage[]) => {
+      if (!activeRunConversation(run)) {
+        return null
+      }
       const ids = uniqueStrings(messages.flatMap((message) => message.attachmentIds))
-      const missingIds = ids.filter((id) => !attachmentCacheRef.current.has(id))
+      const missingIds: string[] = []
+      for (const id of ids) {
+        if (!activeRunConversation(run)) {
+          return null
+        }
+        if (!attachmentCacheRef.current.has(id)) {
+          missingIds.push(id)
+        }
+      }
       if (missingIds.length > 0) {
-        const stored = await dependenciesRef.current.getAttachments(subjectId, missingIds)
+        if (!activeRunConversation(run)) {
+          return null
+        }
+        const stored = await dependenciesRef.current.getAttachments(run.subjectId, missingIds)
+        if (!activeRunConversation(run)) {
+          return null
+        }
         for (const attachment of stored) {
+          if (!activeRunConversation(run)) {
+            return null
+          }
           attachmentCacheRef.current.set(attachment.id, attachment)
         }
       }
-      const resolved = ids.flatMap((id) => {
+      const resolved: PreparedChatAttachment[] = []
+      for (const id of ids) {
+        if (!activeRunConversation(run)) {
+          return null
+        }
         const attachment = attachmentCacheRef.current.get(id)
-        return attachment ? [attachment] : []
-      })
+        if (attachment) {
+          resolved.push(attachment)
+        }
+      }
       if (resolved.length !== ids.length) {
         throw new Error("无法读取当前对话引用的附件，请重新添加后再试")
       }
       return resolved
     },
-    [subjectId],
+    [activeRunConversation],
   )
 
   const terminalTransition = useCallback(
@@ -736,7 +773,10 @@ export function useChatController({ subjectId, dependencies }: UseChatController
         if (!activeRunConversation(run)) {
           return
         }
-        const attachments = await resolveReferencedAttachments(history)
+        const attachments = await resolveReferencedAttachments(run, history)
+        if (!attachments || !activeRunConversation(run)) {
+          return
+        }
         const conversation = activeRunConversation(run)
         if (!conversation) {
           return
@@ -865,7 +905,10 @@ export function useChatController({ subjectId, dependencies }: UseChatController
         stream: run,
       })
 
-      await saveNewAttachments(newAttachments)
+      await saveNewAttachments(run, newAttachments)
+      if (!activeRunConversation(run)) {
+        return
+      }
       const persisted = await persistRunConversation(run)
       if (releaseAfterPersist && persisted?.ok) {
         await attemptStorageWrite(() =>

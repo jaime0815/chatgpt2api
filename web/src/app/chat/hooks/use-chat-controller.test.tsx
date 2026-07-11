@@ -28,9 +28,13 @@ function deferred<Value>() {
   return { promise, resolve }
 }
 
-function attachment(character: string, name = `${character}.txt`): PreparedChatAttachment {
+function attachment(
+  character: string,
+  name = `${character}.txt`,
+  content = `content-${character}`,
+): PreparedChatAttachment {
   const sha256 = character.repeat(64)
-  const blob = new Blob([`content-${character}`], { type: "text/plain" })
+  const blob = new Blob([content], { type: "text/plain" })
   return {
     id: sha256,
     name,
@@ -234,6 +238,15 @@ function createDependencies(options: {
 
 async function renderController(dependencies: ChatControllerDependencies) {
   const hook = renderHook(() => useChatController({ subjectId: SUBJECT_ID, dependencies }))
+  await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
+  return hook
+}
+
+async function renderSubjectController(dependencies: ChatControllerDependencies) {
+  const hook = renderHook(
+    ({ subjectId }: { subjectId: string }) => useChatController({ subjectId, dependencies }),
+    { initialProps: { subjectId: SUBJECT_ID } },
+  )
   await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
   return hook
 }
@@ -793,5 +806,154 @@ describe("useChatController", () => {
     expect(storedConversations.has(conversationId!)).toBe(false)
     expect(dependencies.saveConversation).not.toHaveBeenCalled()
     expect(streamChatFn).not.toHaveBeenCalled()
+  })
+
+  it("keeps a delayed previous-subject save from replacing the current attachment cache", async () => {
+    const aliceAttachment = attachment("a", "alice.txt", "alice bytes")
+    const bobAttachment = attachment("a", "bob.txt", "bob bytes")
+    const aliceSave = deferred<PreparedChatAttachment>()
+    const bobSave = deferred<PreparedChatAttachment>()
+    const releaseBobConversationSave = deferred<void>()
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({ streamChatFn })
+    dependencies.listConversations = vi.fn<ChatControllerDependencies["listConversations"]>(
+      async () => [],
+    )
+    dependencies.getPreferences = vi.fn<ChatControllerDependencies["getPreferences"]>(async () => ({
+      activeConversationId: null,
+      selectedModel: "auto",
+      scrollPositions: {},
+    }))
+    dependencies.saveAttachment = vi.fn<ChatControllerDependencies["saveAttachment"]>(
+      async (subjectId) => {
+        if (subjectId === SUBJECT_ID) {
+          return aliceSave.promise
+        }
+        return bobSave.promise
+      },
+    )
+    dependencies.saveConversation = vi.fn<ChatControllerDependencies["saveConversation"]>(
+      async (subjectId, item) => {
+        if (subjectId === OTHER_SUBJECT_ID && item.messages.at(-1)?.status === "streaming") {
+          await releaseBobConversationSave.promise
+        }
+        return item
+      },
+    )
+    const hook = await renderSubjectController(dependencies)
+    let aliceSending!: Promise<void>
+    let bobSending!: Promise<void>
+
+    act(() => {
+      aliceSending = hook.result.current.sendText({ text: "alice", attachments: [aliceAttachment] })
+    })
+    await waitFor(() => expect(dependencies.saveAttachment).toHaveBeenCalledWith(SUBJECT_ID, aliceAttachment))
+
+    act(() => {
+      hook.rerender({ subjectId: OTHER_SUBJECT_ID })
+    })
+    await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
+
+    act(() => {
+      bobSending = hook.result.current.sendText({ text: "bob", attachments: [bobAttachment] })
+    })
+    await waitFor(() =>
+      expect(dependencies.saveAttachment).toHaveBeenCalledWith(OTHER_SUBJECT_ID, bobAttachment),
+    )
+
+    act(() => {
+      bobSave.resolve(bobAttachment)
+    })
+    await waitFor(() =>
+      expect(dependencies.saveConversation).toHaveBeenCalledWith(
+        OTHER_SUBJECT_ID,
+        expect.objectContaining({
+          messages: expect.arrayContaining([expect.objectContaining({ status: "streaming" })]),
+        }),
+      ),
+    )
+
+    await act(async () => {
+      aliceSave.resolve(aliceAttachment)
+      await aliceSending
+    })
+    await act(async () => {
+      releaseBobConversationSave.resolve()
+      await bobSending
+    })
+
+    const [request, streamedAttachments] = streamChatFn.mock.calls[0]!
+    expect(request.attachments).toEqual([
+      expect.objectContaining({ id: bobAttachment.id, file_name: bobAttachment.name }),
+    ])
+    expect(streamedAttachments).toEqual([bobAttachment])
+    expect(streamedAttachments[0]?.blob).toBe(bobAttachment.blob)
+  })
+
+  it("loads the current subject attachment after a delayed previous-subject read", async () => {
+    const aliceAttachment = attachment("b", "alice-read.txt", "alice bytes")
+    const bobAttachment = attachment("b", "bob-read.txt", "bob bytes")
+    const aliceRead = deferred<PreparedChatAttachment[]>()
+    const streamChatFn = vi.fn<ChatControllerDependencies["streamChatFn"]>(async function* () {
+      yield { type: "complete" } as const
+    })
+    const { dependencies } = createDependencies({ streamChatFn })
+    dependencies.listConversations = vi.fn<ChatControllerDependencies["listConversations"]>(
+      async () => [],
+    )
+    dependencies.getPreferences = vi.fn<ChatControllerDependencies["getPreferences"]>(async () => ({
+      activeConversationId: null,
+      selectedModel: "auto",
+      scrollPositions: {},
+    }))
+    dependencies.getAttachments = vi.fn<ChatControllerDependencies["getAttachments"]>(
+      async (subjectId) => {
+        if (subjectId === SUBJECT_ID) {
+          return aliceRead.promise
+        }
+        return [bobAttachment]
+      },
+    )
+    const hook = await renderSubjectController(dependencies)
+    let aliceSending!: Promise<void>
+
+    act(() => {
+      aliceSending = hook.result.current.sendText({
+        text: "alice read",
+        attachmentIds: [aliceAttachment.id],
+      })
+    })
+    await waitFor(() =>
+      expect(dependencies.getAttachments).toHaveBeenCalledWith(SUBJECT_ID, [aliceAttachment.id]),
+    )
+
+    act(() => {
+      hook.rerender({ subjectId: OTHER_SUBJECT_ID })
+    })
+    await waitFor(() => expect(hook.result.current.state.isLoading).toBe(false))
+
+    await act(async () => {
+      aliceRead.resolve([aliceAttachment])
+      await aliceSending
+    })
+    await act(async () => {
+      await hook.result.current.sendText({
+        text: "bob read",
+        attachmentIds: [bobAttachment.id],
+      })
+    })
+
+    expect(dependencies.getAttachments).toHaveBeenLastCalledWith(
+      OTHER_SUBJECT_ID,
+      [bobAttachment.id],
+    )
+    const [request, streamedAttachments] = streamChatFn.mock.calls[0]!
+    expect(request.attachments).toEqual([
+      expect.objectContaining({ id: bobAttachment.id, file_name: bobAttachment.name }),
+    ])
+    expect(streamedAttachments).toEqual([bobAttachment])
+    expect(streamedAttachments[0]?.blob).toBe(bobAttachment.blob)
   })
 })
