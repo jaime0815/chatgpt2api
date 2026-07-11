@@ -111,6 +111,28 @@ describe("ChatMessage", () => {
     })
   })
 
+  it("does not offer attachment selection while editing a text-only chat turn", () => {
+    render(
+      <ChatMessage
+        message={message({
+          id: "text-only-edit",
+          role: "user",
+          text: "只重发文本",
+          attachmentIds: ["legacy-attachment"],
+        })}
+        attachments={[{ id: "legacy-attachment", name: "旧文件.pdf", kind: "document" }]}
+        allowAttachmentEdits={false}
+        onEditAndResend={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑消息" }))
+
+    expect(screen.getByText("当前版本暂不支持带附件的普通聊天，将仅重发文本。"))
+      .toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "添加附件" })).not.toBeInTheDocument()
+  })
+
   it("reports copy failure without announcing success", async () => {
     const error = new Error("clipboard denied")
     const onCopyError = vi.fn()

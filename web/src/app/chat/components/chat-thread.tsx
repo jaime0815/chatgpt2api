@@ -15,6 +15,7 @@ export type ChatThreadProps = {
   conversationId: string | null
   messages: readonly ChatMessageValue[]
   attachments?: readonly ChatMessageAttachment[]
+  allowAttachmentEdits?: boolean
   initialScrollTop?: number
   scrollCommitDelayMs?: number
   onScrollTopChange?: (scrollTop: number) => void
@@ -39,6 +40,7 @@ export function ChatThread({
   conversationId,
   messages,
   attachments = [],
+  allowAttachmentEdits = true,
   initialScrollTop = 0,
   scrollCommitDelayMs = 300,
   onScrollTopChange,
@@ -156,6 +158,7 @@ export function ChatThread({
                 key={message.id}
                 message={message}
                 attachments={attachments}
+                allowAttachmentEdits={allowAttachmentEdits}
                 onCopy={onCopy}
                 onCopyError={onCopyError}
                 onEditAndResend={onEditAndResend}

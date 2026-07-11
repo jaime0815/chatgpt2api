@@ -44,6 +44,7 @@ export type ChatMessageEditSubmission = {
 export type ChatMessageProps = {
   message: ChatMessageValue
   attachments?: readonly ChatMessageAttachment[]
+  allowAttachmentEdits?: boolean
   onCopy?: (text: string) => void | Promise<void>
   onCopyError?: (error: unknown) => void
   onEditAndResend?: (
@@ -420,6 +421,7 @@ function GeneratedImages({
 function ChatMessageComponent({
   message,
   attachments = [],
+  allowAttachmentEdits = true,
   onCopy,
   onCopyError,
   onEditAndResend,
@@ -477,14 +479,20 @@ function ChatMessageComponent({
               disabled={editSaving}
               onChange={(event) => setEditText(event.target.value)}
             />
-            <EditAttachments
-              attachmentIds={editAttachmentIds}
-              attachments={messageAttachments}
-              files={editFiles}
-              onAttachmentIdsChange={setEditAttachmentIds}
-              onFilesChange={setEditFiles}
-              disabled={editSaving}
-            />
+            {allowAttachmentEdits ? (
+              <EditAttachments
+                attachmentIds={editAttachmentIds}
+                attachments={messageAttachments}
+                files={editFiles}
+                onAttachmentIdsChange={setEditAttachmentIds}
+                onFilesChange={setEditFiles}
+                disabled={editSaving}
+              />
+            ) : (
+              <p className="mt-3 text-sm text-muted-foreground">
+                当前版本暂不支持带附件的普通聊天，将仅重发文本。
+              </p>
+            )}
             {editError ? (
               <p role="alert" className="mt-2 text-sm text-destructive">
                 {editError}
@@ -498,7 +506,7 @@ function ChatMessageComponent({
                 disabled={editSaving}
                 onClick={() => {
                   setEditText(message.text)
-                  setEditAttachmentIds([...message.attachmentIds])
+                  setEditAttachmentIds(allowAttachmentEdits ? [...message.attachmentIds] : [])
                   setEditFiles([])
                   setEditError(null)
                   setEditing(false)
@@ -596,7 +604,7 @@ function ChatMessageComponent({
               label="编辑消息"
               onClick={() => {
                 setEditText(message.text)
-                setEditAttachmentIds([...message.attachmentIds])
+                setEditAttachmentIds(allowAttachmentEdits ? [...message.attachmentIds] : [])
                 setEditFiles([])
                 setEditError(null)
                 setEditing(true)
