@@ -512,32 +512,62 @@ export function useChatImageTasks({
 
   const resumeImageTask = useCallback(
     async (message: ChatMessage, taskId: string) => {
-      const { message: registered, epoch } = registerMessage(message)
-      const workspaceAuthKey = String(authKeyRef.current || "").trim()
-      const task = workspaceAuthKey
-        ? await dependenciesRef.current.resumeImagePoll(taskId, undefined, workspaceAuthKey)
-        : await dependenciesRef.current.resumeImagePoll(taskId)
-      if (!isMessageActive(registered.id, epoch)) {
-        return messagesRef.current.get(registered.id) || registered
+      const current = messagesRef.current.get(message.id) || message
+      const currentImage = current.images?.find((image) => image.taskId === taskId)
+      if (
+        currentImage?.status === "queued" ||
+        currentImage?.status === "running" ||
+        currentImage?.status === "success"
+      ) {
+        return current
       }
-      const current = messagesRef.current.get(registered.id)
-      if (!current) {
+      const { message: registered, epoch } = registerMessage(current)
+      const lockKey = `resume:${taskId}`
+      let locks = retryLocksRef.current.get(registered.id)
+      if (locks?.get(lockKey) === epoch) {
         return registered
       }
-      const resumed: ChatMessage = {
-        ...current,
-        images: (current.images || []).map((image) =>
-          image.taskId === taskId ? { ...image, status: "running" as const, error: undefined } : image,
-        ),
+      if (!locks) {
+        locks = new Map<string, number>()
+        retryLocksRef.current.set(registered.id, locks)
       }
-      const next = await emit(applyImageTaskToChatMessage(resumed, task), epoch)
-      if (!isMessageActive(next.id, epoch)) {
+      locks.set(lockKey, epoch)
+
+      try {
+        const workspaceAuthKey = String(authKeyRef.current || "").trim()
+        const task = workspaceAuthKey
+          ? await dependenciesRef.current.resumeImagePoll(taskId, undefined, workspaceAuthKey)
+          : await dependenciesRef.current.resumeImagePoll(taskId)
+        if (!isMessageActive(registered.id, epoch)) {
+          return messagesRef.current.get(registered.id) || registered
+        }
+        const live = messagesRef.current.get(registered.id)
+        if (!live) {
+          return registered
+        }
+        const resumed: ChatMessage = {
+          ...live,
+          images: (live.images || []).map((image) =>
+            image.taskId === taskId ? { ...image, status: "running" as const, error: undefined } : image,
+          ),
+        }
+        const next = await emit(applyImageTaskToChatMessage(resumed, task), epoch)
+        if (!isMessageActive(next.id, epoch)) {
+          return messagesRef.current.get(next.id) || next
+        }
+        if (pendingTaskIds(next).length > 0) {
+          await ensurePolling(next.id, epoch)
+        }
         return messagesRef.current.get(next.id) || next
+      } finally {
+        const currentLocks = retryLocksRef.current.get(registered.id)
+        if (currentLocks?.get(lockKey) === epoch) {
+          currentLocks.delete(lockKey)
+          if (currentLocks.size === 0) {
+            retryLocksRef.current.delete(registered.id)
+          }
+        }
       }
-      if (pendingTaskIds(next).length > 0) {
-        await ensurePolling(next.id, epoch)
-      }
-      return messagesRef.current.get(next.id) || next
     },
     [emit, ensurePolling, isMessageActive, registerMessage],
   )

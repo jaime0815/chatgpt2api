@@ -362,6 +362,40 @@ describe("useChatImageTasks", () => {
     )
   })
 
+  it("starts only one resume request while the first resume is pending", async () => {
+    const resumedTask = deferred<ImageTask>()
+    const dependencies = createDependencies({
+      resumeImagePoll: vi.fn(async () => resumedTask.promise),
+    })
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const message: ChatMessage = {
+      id: "assistant-resume-lock",
+      role: "assistant",
+      text: "",
+      attachmentIds: [],
+      status: "error",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      images: [{ id: "timed-out", taskId: "timed-out-task", status: "error", error: "生成超时" }],
+    }
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    let firstResume!: Promise<ChatMessage>
+    let secondResume!: Promise<ChatMessage>
+    act(() => {
+      firstResume = result.current.resumeImageTask(message, "timed-out-task")
+      secondResume = result.current.resumeImageTask(message, "timed-out-task")
+    })
+    await waitFor(() => expect(dependencies.resumeImagePoll).toHaveBeenCalledOnce())
+
+    await act(async () => {
+      resumedTask.resolve(task("timed-out-task", "running"))
+      await Promise.all([firstResume, secondResume])
+    })
+    expect(dependencies.resumeImagePoll).toHaveBeenCalledOnce()
+  })
+
   it("retries one failed image with its saved parameter snapshot", async () => {
     const dependencies = createDependencies()
     const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
