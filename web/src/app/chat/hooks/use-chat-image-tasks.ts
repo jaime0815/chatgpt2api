@@ -229,14 +229,18 @@ export function useChatImageTasks({
         if (pollIntervalMs > 0 && (!immediate || !firstRequest)) {
           await dependenciesRef.current.wait(pollIntervalMs)
         }
-        if (disposedRef.current) {
+        if (disposedRef.current || !messagesRef.current.has(messageId)) {
           return
         }
         try {
           const taskList = await dependenciesRef.current.fetchImageTasks(ids)
           firstRequest = false
           consecutiveErrors = 0
-          let next = messagesRef.current.get(messageId) || current
+          const latest = messagesRef.current.get(messageId)
+          if (!latest) {
+            return
+          }
+          let next = latest
           for (const task of taskList.items) {
             next = applyImageTaskToChatMessage(next, task)
           }
@@ -367,7 +371,7 @@ export function useChatImageTasks({
       const message: ChatMessage = {
         id: messageId,
         role: "assistant",
-        text: "",
+        text: prompt,
         attachmentIds: referenceAttachmentIds,
         status: "queued",
         createdAt: dependenciesRef.current.now().toISOString(),
@@ -397,6 +401,23 @@ export function useChatImageTasks({
     },
     [ensurePolling],
   )
+
+  const discardImageMessages = useCallback((messageIds: readonly string[]) => {
+    const taskIds = new Set<string>()
+    for (const messageId of messageIds) {
+      const message = messagesRef.current.get(messageId)
+      if (!message) {
+        continue
+      }
+      for (const taskId of pendingTaskIds(message)) {
+        taskIds.add(taskId)
+      }
+      messagesRef.current.delete(messageId)
+    }
+    if (taskIds.size > 0) {
+      setActiveTaskIds((previous) => previous.filter((taskId) => !taskIds.has(taskId)))
+    }
+  }, [])
 
   const resumeImageTask = useCallback(
     async (message: ChatMessage, taskId: string) => {
@@ -467,6 +488,7 @@ export function useChatImageTasks({
     isGenerating: activeTaskIds.length > 0,
     submit,
     recoverImageMessages,
+    discardImageMessages,
     resumeImageTask,
     retryImageTask,
   }

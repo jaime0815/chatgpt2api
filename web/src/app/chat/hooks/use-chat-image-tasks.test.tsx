@@ -106,6 +106,7 @@ describe("useChatImageTasks", () => {
 
     expect(message).toMatchObject({
       role: "assistant",
+      text: "draw a city",
       status: "queued",
       attachmentIds: ["reference"],
       imageSettings: {
@@ -163,6 +164,44 @@ describe("useChatImageTasks", () => {
         images: [expect.objectContaining({ taskId: "persisted-task", url: "/images/persisted-task.png" })],
       }),
     )
+  })
+
+  it("discards deleted image messages before a pending poll can emit another update", async () => {
+    const nextTasks = deferred<{ items: ImageTask[]; missing_ids: string[] }>()
+    const dependencies = createDependencies({
+      fetchImageTasks: vi.fn(async () => nextTasks.promise),
+    })
+    const onMessageChange = vi.fn(async (_message: ChatMessage) => undefined)
+    const { result } = renderHook(() =>
+      useChatImageTasks({ onMessageChange, dependencies, pollIntervalMs: 0 }),
+    )
+
+    let message!: ChatMessage
+    await act(async () => {
+      message = await result.current.submit({
+        prompt: "draw city",
+        settings: { ...SETTINGS, count: "1" },
+      })
+    })
+    await waitFor(() => expect(dependencies.fetchImageTasks).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(result.current.activeTaskIds).toHaveLength(1))
+    onMessageChange.mockClear()
+
+    act(() => {
+      result.current.discardImageMessages([message.id])
+    })
+    expect(result.current.activeTaskIds).toEqual([])
+
+    await act(async () => {
+      nextTasks.resolve({
+        items: [task(message.images?.[0]?.taskId || "missing", "success")],
+        missing_ids: [],
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(onMessageChange).not.toHaveBeenCalled()
   })
 
   it("resumes timed-out tasks through the existing resume API", async () => {
