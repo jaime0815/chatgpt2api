@@ -114,8 +114,31 @@ else
   exit 1
 fi
 
+remove_legacy_compose_containers() {
+  local container_name
+  local -a container_ids
+
+  while IFS= read -r container_name; do
+    [[ -n "$container_name" ]] || continue
+    container_ids=()
+    mapfile -t container_ids < <(docker ps -aq --filter "name=$container_name")
+    if (( ${#container_ids[@]} == 0 )); then
+      continue
+    fi
+    printf 'Removing stale legacy Compose container(s) for %s\n' "$container_name"
+    docker rm -f "${container_ids[@]}"
+  done < <(
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" config |
+      sed -n 's/^[[:space:]]*container_name:[[:space:]]*//p' |
+      tr -d "\"'"
+  )
+}
+
 if [[ "$COMPOSE_IMPL" == "v1" ]]; then
-  "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down --remove-orphans
+  if ! "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down --remove-orphans; then
+    echo "legacy docker-compose down failed; removing stale declared containers" >&2
+  fi
+  remove_legacy_compose_containers
 fi
 
 CMD=("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" up -d)
