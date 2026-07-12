@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha2.js"
+
 import type { ChatAttachmentKind, PreparedChatAttachment } from "./chat-types"
 
 const MIB = 1024 * 1024
@@ -69,7 +71,6 @@ export type ChatAttachmentValidationCode =
   | "message_too_large"
   | "working_set_too_large"
   | "document_in_image_mode"
-  | "hash_unavailable"
 
 export class ChatAttachmentValidationError extends Error {
   readonly code: ChatAttachmentValidationCode
@@ -128,7 +129,7 @@ async function readBlobBuffer(blob: Blob) {
   })
 }
 
-function hexDigest(bytes: ArrayBuffer) {
+function hexDigest(bytes: ArrayBuffer | Uint8Array) {
   return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
@@ -185,22 +186,21 @@ function validateFileMetadataBatch(
 
 function getSubtleCrypto() {
   const subtle = globalThis.crypto?.subtle
-  if (!subtle || typeof subtle.digest !== "function") {
-    throw new ChatAttachmentValidationError(
-      "hash_unavailable",
-      "当前浏览器不支持附件 SHA-256 校验，请升级浏览器后重试",
-    )
-  }
-  return subtle
+  return subtle && typeof subtle.digest === "function" ? subtle : null
+}
+
+async function digestSha256(buffer: ArrayBuffer, subtle: SubtleCrypto | null) {
+  const bytes = new Uint8Array(buffer)
+  return subtle ? new Uint8Array(await subtle.digest("SHA-256", bytes)) : sha256(bytes)
 }
 
 async function prepareInspectedChatAttachment(
   inspected: InspectedChatFile,
-  subtle: SubtleCrypto,
+  subtle: SubtleCrypto | null,
 ): Promise<PreparedChatAttachment> {
   const { file, supportedType } = inspected
   const buffer = await readBlobBuffer(file)
-  const digest = await subtle.digest("SHA-256", new Uint8Array(buffer))
+  const digest = await digestSha256(buffer, subtle)
   const sha256 = hexDigest(digest)
   return {
     id: sha256,

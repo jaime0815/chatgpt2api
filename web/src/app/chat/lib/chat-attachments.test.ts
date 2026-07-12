@@ -112,17 +112,17 @@ describe("prepareChatAttachment", () => {
     expect(arrayBuffer).not.toHaveBeenCalled()
   })
 
-  it("reports an actionable error before reading when WebCrypto SHA-256 is unavailable", async () => {
+  it("falls back to a compatible SHA-256 implementation when WebCrypto is unavailable", async () => {
     const file = new File(["content"], "sample.pdf", { type: "application/pdf" })
-    const arrayBuffer = vi.fn().mockResolvedValue(new ArrayBuffer(0))
+    const arrayBuffer = vi.fn().mockResolvedValue(new TextEncoder().encode("content").buffer)
     Object.defineProperty(file, "arrayBuffer", { value: arrayBuffer })
     vi.stubGlobal("crypto", {})
 
-    await expect(prepareChatAttachment(file)).rejects.toMatchObject({
-      code: "hash_unavailable",
-      message: "当前浏览器不支持附件 SHA-256 校验，请升级浏览器后重试",
+    await expect(prepareChatAttachment(file)).resolves.toMatchObject({
+      id: "ed7002b439e9ac845f22357d822bac1444730fbdb6016d3ec9432297b9ec9f73",
+      sha256: "ed7002b439e9ac845f22357d822bac1444730fbdb6016d3ec9432297b9ec9f73",
     })
-    expect(arrayBuffer).not.toHaveBeenCalled()
+    expect(arrayBuffer).toHaveBeenCalledOnce()
   })
 
   it("rejects a non-empty MIME that does not match the extension", async () => {
