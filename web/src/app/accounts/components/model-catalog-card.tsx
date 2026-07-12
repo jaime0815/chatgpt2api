@@ -2,8 +2,7 @@ import { RefreshCw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import type { Model } from "@/lib/api"
-
-import { groupModelsByProvider } from "./model-provider"
+import { groupModelsByProvider } from "@/lib/model-providers"
 
 type ModelCatalogCardProps = {
   models: Model[]

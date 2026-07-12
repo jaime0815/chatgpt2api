@@ -25,12 +25,12 @@ beforeAll(() => {
 })
 
 describe("ChatModelSelect", () => {
-  it("filters image models and reports a chat model selection", async () => {
+  it("groups selectable text models by provider and reports a normal-user selection", async () => {
     const onValueChange = vi.fn()
     const user = userEvent.setup()
     render(
       <ChatModelSelect
-        models={["gpt-5.4", "gpt-image-2", "codex-mini-latest"]}
+        models={["gpt-5.4", "claude-sonnet-4", "gpt-image-2", "codex-mini-latest"]}
         value="auto"
         onValueChange={onValueChange}
       />,
@@ -40,8 +40,22 @@ describe("ChatModelSelect", () => {
     await user.click(trigger)
 
     expect(screen.queryByRole("option", { name: "gpt-image-2" })).not.toBeInTheDocument()
-    await user.click(screen.getByRole("option", { name: "gpt-5.4" }))
-    expect(onValueChange).toHaveBeenCalledWith("gpt-5.4")
+    expect(screen.getByText("OpenAI")).toBeInTheDocument()
+    expect(screen.getByText("Anthropic")).toBeInTheDocument()
+    await user.click(screen.getByRole("option", { name: "claude-sonnet-4" }))
+    expect(onValueChange).toHaveBeenCalledWith("claude-sonnet-4")
+  })
+
+  it("does not expose a selectable list when no text model is available", () => {
+    render(
+      <ChatModelSelect
+        models={["gpt-image-2"]}
+        value="auto"
+        onValueChange={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole("combobox", { name: "聊天模型" })).toBeDisabled()
   })
 
   it("shows an unavailable model warning without selecting another concrete model", () => {

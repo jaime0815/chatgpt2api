@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import type { Model } from "@/lib/api"
 
-import { classifyModelProvider, groupModelsByProvider } from "./model-provider"
+import { classifyModelProvider, groupModelsByProvider } from "@/lib/model-providers"
 
 function model(id: string): Model {
   return {

@@ -6,9 +6,11 @@ import {
   SelectContent,
   SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { groupModelIdsByProvider } from "@/lib/model-providers"
 import { cn } from "@/lib/utils"
 
 export type ChatModelOption = string | { id?: unknown }
@@ -35,26 +37,35 @@ export function ChatModelSelect({
   className,
 }: ChatModelSelectProps) {
   const chatModels = filterChatModels(models)
-  const selected = chatModels.includes(value) ? value : "auto"
+  const hasSelectableModels = chatModels.some((model) => model !== "auto")
+  const selected = hasSelectableModels && chatModels.includes(value) ? value : "auto"
+  const providerGroups = groupModelIdsByProvider(chatModels)
 
   return (
     <div className={cn("flex min-w-0 flex-col items-center gap-0.5", className)}>
-      <Select value={selected} onValueChange={onValueChange} disabled={disabled}>
+      <Select value={selected} onValueChange={onValueChange} disabled={disabled || !hasSelectableModels}>
         <SelectTrigger
           aria-label="聊天模型"
           className="h-9 w-auto min-w-[112px] max-w-[min(58vw,240px)] rounded-md border-0 bg-transparent px-2 text-sm font-medium shadow-none hover:bg-accent focus-visible:ring-2"
         >
           <SelectValue>{modelLabel(selected)}</SelectValue>
         </SelectTrigger>
-        <SelectContent position="popper" align="center" className="min-w-[200px] rounded-md">
-          <SelectGroup>
-            {chatModels.map((model) => (
-              <SelectItem key={model} value={model} className="rounded-md">
-                {modelLabel(model)}
-              </SelectItem>
+        {hasSelectableModels ? (
+          <SelectContent position="popper" align="center" className="min-w-[200px] rounded-md">
+            {providerGroups.map((group) => (
+              <SelectGroup key={group.id}>
+                <SelectLabel className="px-3 py-1.5 text-[11px] text-muted-foreground">
+                  {group.label}
+                </SelectLabel>
+                {group.modelIds.map((model) => (
+                  <SelectItem key={model} value={model} className="rounded-md">
+                    {modelLabel(model)}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
             ))}
-          </SelectGroup>
-        </SelectContent>
+          </SelectContent>
+        ) : null}
       </Select>
       {unavailableModel ? (
         <span

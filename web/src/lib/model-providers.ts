@@ -24,6 +24,12 @@ export type ModelProviderGroup = {
   models: Model[]
 }
 
+export type ModelIdProviderGroup = {
+  id: ModelProviderId
+  label: string
+  modelIds: string[]
+}
+
 const namespaceProviders: Record<string, ModelProviderId> = {
   openai: "openai",
   anthropic: "anthropic",
@@ -64,6 +70,14 @@ function normalizeModelId(modelId: string) {
     .replace(/^(?:plus|team|pro)-(?=codex-gpt-image)/, "")
 }
 
+function newProviderBuckets<T>() {
+  const buckets = new Map<ModelProviderId, T[]>()
+  for (const provider of providerDefinitions) {
+    buckets.set(provider.id, [])
+  }
+  return buckets
+}
+
 export function classifyModelProvider(modelId: string): ModelProviderId {
   const normalized = normalizeModelId(modelId)
   const namespace = normalized.match(/^([a-z0-9-]+)[/:]/)?.[1]
@@ -80,10 +94,7 @@ export function classifyModelProvider(modelId: string): ModelProviderId {
 }
 
 export function groupModelsByProvider(models: readonly Model[]): ModelProviderGroup[] {
-  const modelsByProvider = new Map<ModelProviderId, Model[]>()
-  for (const provider of providerDefinitions) {
-    modelsByProvider.set(provider.id, [])
-  }
+  const modelsByProvider = newProviderBuckets<Model>()
   for (const model of models) {
     modelsByProvider.get(classifyModelProvider(model.id))?.push(model)
   }
@@ -92,6 +103,20 @@ export function groupModelsByProvider(models: readonly Model[]): ModelProviderGr
     const providerModels = modelsByProvider.get(provider.id) || []
     return providerModels.length > 0
       ? [{ id: provider.id, label: provider.label, models: providerModels }]
+      : []
+  })
+}
+
+export function groupModelIdsByProvider(modelIds: readonly string[]): ModelIdProviderGroup[] {
+  const idsByProvider = newProviderBuckets<string>()
+  for (const modelId of modelIds) {
+    idsByProvider.get(classifyModelProvider(modelId))?.push(modelId)
+  }
+
+  return providerDefinitions.flatMap((provider) => {
+    const providerModelIds = idsByProvider.get(provider.id) || []
+    return providerModelIds.length > 0
+      ? [{ id: provider.id, label: provider.label, modelIds: providerModelIds }]
       : []
   })
 }
