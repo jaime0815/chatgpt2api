@@ -20,7 +20,11 @@ dependencies = [
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple"
