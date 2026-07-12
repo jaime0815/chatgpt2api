@@ -319,6 +319,116 @@ def test_document_processing_metadata_does_not_fall_back_to_creation_id(
     assert metadata["mime_type"] == "application/pdf"
 
 
+def test_document_processing_accepts_json_lines_without_sse_done_marker(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            b'{"event":"file.processing.started","progress":10}',
+            b'{"event":"file.processing.completed","progress":100,'
+            b'"extra":{"metadata_object_id":"processing-library-secret","total_tokens":42}}',
+        ]),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    uploaded = backend.upload_chat_attachment_bytes(
+        b"%PDF-1.7",
+        "sample.pdf",
+        "application/pdf",
+        "document",
+    )
+
+    assert uploaded["metadata_attachment"] == {
+        "id": "file-secret",
+        "name": "sample.pdf",
+        "mime_type": "application/pdf",
+        "size": 8,
+        "is_big_paste": False,
+        "library_file_id": "processing-library-secret",
+        "file_token_size": 42,
+    }
+
+
+def test_document_processing_rejects_statusless_legacy_sse_completion(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            b'data: {"event":"file.processing.completed"}',
+            b"data: [DONE]",
+        ]),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    with pytest.raises(UpstreamHTTPError, match="did not complete"):
+        backend.upload_chat_attachment_bytes(
+            b"%PDF-1.7",
+            "sample.pdf",
+            "application/pdf",
+            "document",
+        )
+
+
+def test_document_processing_rejects_malformed_json_line_without_sse_done_marker(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            b'{"event":',
+            b'data: {"event":"file.processing.completed"}',
+        ]),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    with pytest.raises(UpstreamHTTPError, match="did not complete"):
+        backend.upload_chat_attachment_bytes(
+            b"%PDF-1.7",
+            "sample.pdf",
+            "application/pdf",
+            "document",
+        )
+
+
+def test_document_processing_rejects_json_line_failure_after_completion(
+    signed_upload: _SignedUploadTransport,
+) -> None:
+    backend, _session = _backend([
+        _FakeResponse(payload={
+            "file_id": "file-secret",
+            "upload_url": "https://upload.test/blob?sig=signed-secret",
+        }),
+        _FakeResponse(payload={"status": "success"}),
+        _FakeResponse(lines=[
+            b'{"event":"file.processing.completed"}',
+            b'{"event":"file.processing.failed","error":{"code":"processing_failed"}}',
+        ]),
+    ])
+    signed_upload.responses.append(_FakeResponse(status_code=201))
+
+    with pytest.raises(UpstreamHTTPError, match="did not complete"):
+        backend.upload_chat_attachment_bytes(
+            b"%PDF-1.7",
+            "sample.pdf",
+            "application/pdf",
+            "document",
+        )
+
+
 def test_document_processing_merges_metadata_from_multiple_final_events(
     signed_upload: _SignedUploadTransport,
 ) -> None:

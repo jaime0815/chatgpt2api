@@ -1328,6 +1328,28 @@ class OpenAIBackendAPI:
         return enrichment
 
     @staticmethod
+    def _iter_chat_attachment_processing_payloads(response: Any) -> Iterator[tuple[str, bool]]:
+        """Read both legacy SSE and current JSON-lines processing responses."""
+        for raw_line in response.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if payload:
+                    yield payload, False
+                continue
+            payload = line.strip()
+            if not payload.startswith("{"):
+                continue
+            try:
+                event = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(event, dict):
+                yield payload, True
+
+    @staticmethod
     def _chat_attachment_request(context: str, request: Callable[[], Any]) -> Any:
         try:
             return request()
@@ -1367,8 +1389,10 @@ class OpenAIBackendAPI:
             completed = False
             done = False
             failed = False
+            json_line_stream = False
             enrichment: Dict[str, Any] = {}
-            for payload in iter_sse_payloads(response):
+            for payload, is_json_line in self._iter_chat_attachment_processing_payloads(response):
+                json_line_stream = json_line_stream or is_json_line
                 if payload == "[DONE]":
                     done = True
                     break
@@ -1385,11 +1409,14 @@ class OpenAIBackendAPI:
                 status = str(event.get("status") or "").lower()
                 if (
                     event_name == "file.processing.completed"
-                    and status in CHAT_ATTACHMENT_PROCESSING_SUCCESS_STATES
+                    and (
+                        status in CHAT_ATTACHMENT_PROCESSING_SUCCESS_STATES
+                        or (is_json_line and not status)
+                    )
                 ):
                     completed = True
                     enrichment.update(self._chat_attachment_processing_enrichment(event))
-            if failed or not completed or not done:
+            if failed or not completed or (not done and not json_line_stream):
                 raise UpstreamHTTPError(
                     "chat attachment processing",
                     502,
