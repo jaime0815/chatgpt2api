@@ -1,174 +1,105 @@
-# 部署与升级指南
+# ChatCanvas 部署与维护
 
-本文介绍 ChatGPT2API 的常见部署方式，以及后续升级项目时需要保留的数据和执行步骤。
+ChatCanvas 是基于 ChatGPT2API 的衍生工程。产品名称不改变既有 `/v1` 兼容接口、`/chatgpt2api` 默认部署路径、容器和环境变量中的 `chatgpt2api` 技术标识。
 
 ## 部署前准备
 
-服务器需要安装：
-
-- Docker
-- Docker Compose v2
-- Git
-
-首次部署前建议确认：
+服务器需要安装 Git、Docker，以及 Docker Compose v1 或 v2。统一启动脚本会自动识别 Compose 实现和当前 CPU 架构。
 
 ```bash
 docker version
-docker compose version
 git --version
+./scripts/docker-up.sh --help
 ```
 
-项目核心持久化文件：
+运行数据包含上游账号、应用配置、上传文件、图片任务和调用日志，应按敏感数据管理。不要把 `config.json`、`data/`、`.env`、账号 token 或 API 密钥提交到仓库。
 
-| 路径 | 作用 |
+## Docker 快速部署
+
+```bash
+git clone git@github.com:jaime0815/chatgpt2api.git chatcanvas
+cd chatcanvas
+
+# 在首次启动前编辑 config.json，将 auth-key 改为高强度随机值。
+./scripts/docker-up.sh
+```
+
+默认地址：
+
+| 入口 | 地址 |
 | --- | --- |
-| `config.json` | 主配置、后台密钥、代理、图片、备份等配置 |
-| `.env` | Docker compose 环境变量 |
-| `data/` | 账号、日志、图片、任务记录等运行数据 |
+| 管理面板 | `http://localhost:3000/chatgpt2api/` |
+| 普通用户聊天 | `http://localhost:3000/chatgpt2api/chat/` |
+| 图像工作台 | `http://localhost:3000/chatgpt2api/image/` |
+| 兼容 API | `http://localhost:3000/chatgpt2api/v1` |
 
-升级和迁移时重点保留以上内容。
+`./scripts/docker-up.sh` 使用 `docker-compose.local.yml` 构建并启动本项目。请不要用保留的 `docker-compose.yml` 部署 ChatCanvas：该文件会拉取上游镜像，而不是当前源码构建的镜像。
 
-Docker Compose 默认使用 host bind mount 保存运行数据：
+### 持久化路径
 
-- `${CHATGPT2API_HOST_DATA_DIR:-/etc/chatgpt2api/data}` 挂载到容器 `/app/data`
-- `${CHATGPT2API_HOST_CONFIG_FILE:-/etc/chatgpt2api/config.json}` 挂载到容器 `/app/config.json`
+本地部署默认把容器目录挂载到宿主机：
 
-其中 `data/` 会保存号池、图片、日志、任务记录和本地 SQLite 数据库。需要改到其他宿主机目录时，在 `.env` 中覆盖这两个变量即可。首次切到默认的 `/etc/chatgpt2api/` 前缀时，启动脚本会在目标文件或目录不存在时，从仓库当前的 `config.json` 和 `data/` 复制一份初始内容。
+| 宿主机路径 | 容器路径 | 内容 |
+| --- | --- | --- |
+| `/etc/chatgpt2api/data` | `/app/data` | 账号、上传文件、图片、任务、日志和本地数据库 |
+| `/etc/chatgpt2api/config.json` | `/app/config.json` | 应用与后台配置 |
 
-## 统一启动脚本
-
-仓库内置了统一入口脚本：
+首次启动时，脚本仅在宿主机目标不存在或数据目录为空时，从仓库的 `config.json` 和 `data/` 初始化内容。后续更新不会覆盖这两个位置。需要自定义路径时，在运行脚本前设置：
 
 ```bash
+export CHATGPT2API_HOST_DATA_DIR=/srv/chatcanvas/data
+export CHATGPT2API_HOST_CONFIG_FILE=/srv/chatcanvas/config.json
 ./scripts/docker-up.sh
 ```
 
-默认行为：
+当前用户无法写入 `/etc/chatgpt2api` 时，也应使用上述变量指定自己可管理且已受权限保护的目录。
 
-- 启动 `local` 部署
-- 执行 `docker compose up -d --build`
-- 自动按当前机器架构注入构建平台参数
+本地 Compose 配置直接使用宿主机配置文件；单独在 `.env` 设置 `CHATGPT2API_AUTH_KEY` 不会覆盖本地部署的 `auth-key`。请在首次启动前修改 `config.json`，或直接修改持久化后的宿主机配置文件并重启服务。
 
-常用示例：
+### 日常操作
 
 ```bash
+# 拉取已推送的代码后重建镜像并更新
+git pull --ff-only
+./scripts/docker-up.sh
+
+# 不重建镜像启动
 ./scripts/docker-up.sh --no-build
-./scripts/docker-up.sh --warp
-./scripts/docker-up.sh --warp --no-build
+
+# 停止服务
 ./scripts/docker-stop.sh
-./scripts/docker-stop.sh --warp
+
+# 查看容器与日志
+docker ps --filter name=chatgpt2api-local
+docker logs -f chatgpt2api-local
 ```
 
-## 方式一：普通 Docker 部署
+## WARP / FlareSolverr 模式
 
-适合不需要 WARP / FlareSolverr 清障的场景。
-
-```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
-```
-
-设置 `config.json` 中的 `auth-key`，或在 `docker-compose.yml` 中配置：
-
-```yaml
-environment:
-  - CHATGPT2API_AUTH_KEY=your_secret_key
-```
-
-启动：
-
-```bash
-./scripts/docker-up.sh
-```
-
-访问：
-
-```text
-http://localhost:3000/chatgpt2api/
-```
-
-API 基础地址：
-
-```text
-http://localhost:3000/chatgpt2api/v1
-```
-
-查看日志：
-
-```bash
-docker logs -f chatgpt2api
-```
-
-停止：
-
-```bash
-./scripts/docker-stop.sh
-```
-
-## 方式二：WARP / FlareSolverr 部署
-
-适合上游请求经常遇到 Cloudflare 拦截的场景。该方式会启动：
-
-- `warp-proxy`
-- `privoxy`
-- `flaresolverr`
-- `init-config`
-- `app`
-
-复制环境变量模板：
+当上游请求遇到 Cloudflare 拦截时，可启用 WARP、Privoxy 和 FlareSolverr：
 
 ```bash
 cp .env.example .env
-```
-
-至少修改 `.env` 中的：
-
-```text
-CHATGPT2API_AUTH_KEY=your_secret_key_here
-```
-
-启动：
-
-```bash
+# 根据部署环境编辑 .env；不要提交其中的敏感值。
 ./scripts/docker-up.sh --warp
 ```
 
-访问：
-
-```text
-http://localhost:3000/chatgpt2api/
-```
-
-FlareSolverr 相关配置可以在后台设置页的 `FlareSolverr` tab 中查看和测试。
-
-查看容器状态：
+该模式的主服务仍默认提供 `http://localhost:3000/chatgpt2api/`，并额外启动本地回环地址上的 WARP、Privoxy 和 FlareSolverr 组件。停止和排查命令：
 
 ```bash
-docker compose -f docker-compose.warp.yml ps
-```
-
-查看日志：
-
-```bash
+./scripts/docker-stop.sh --warp
+docker ps --filter name=chatgpt2api
 docker logs -f chatgpt2api-warp
 docker logs -f chatgpt2api-flaresolverr
 ```
 
-停止：
+账号自身代理优先于稳定代理运行时；稳定代理优先于显式代理和旧版全局代理。详细运行时配置见 `.env.example` 与后台设置页。
 
-```bash
-./scripts/docker-stop.sh --warp
-```
-
-## 方式三：源码运行
-
-适合本地开发或临时调试。
+## 源码开发与子路径
 
 后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
 uv sync
 uv run main.py
 ```
@@ -181,229 +112,70 @@ bun install
 bun run dev
 ```
 
-### 子路径 / nginx 前缀部署
-
-前端和同源 API 默认放在 `/chatgpt2api` 子路径下，例如 `https://example.com/chatgpt2api/`。
-
-源码构建前端：
+默认前端与同源 API 位于 `/chatgpt2api`，包括静态资源、`/api` 和 `/v1`。需要其他反向代理子路径时，在构建前设置 `NEXT_PUBLIC_BASE_PATH`：
 
 ```bash
 cd web
-bun run build
+NEXT_PUBLIC_BASE_PATH=/custom-path bun run build
 ```
 
-Docker 本地构建：
-
-```bash
-docker compose -f docker-compose.local.yml up -d --build
-```
-
-默认的 `NEXT_PUBLIC_BASE_PATH` 是 `/chatgpt2api`，会写入 Next.js `basePath`，并让 public 图标、同源 `/api`、`/v1` 请求以及后端静态文件服务使用同一前缀。如果需要改成其他路径，可在构建时覆盖 `NEXT_PUBLIC_BASE_PATH`；使用预构建镜像时，前端静态资源已经编译完成，改路径需要自构建镜像。
-
-源码方式运行时，后端默认读取项目根目录的 `config.json` 和 `data/`。
+预构建前端会把该路径写入静态产物，修改后必须重新构建镜像或前端。
 
 ## 存储后端
 
-默认使用本地 JSON 文件：
+可用后端为 `json`、`sqlite`、`postgres` 和 `git`。不同部署配置的默认值不同：`docker-compose.local.yml` 固定使用 SQLite，WARP 配置在未设置时使用 JSON；不要假定所有模式共享同一个默认值。
 
-```text
-STORAGE_BACKEND=json
-```
-
-可选值：
-
-| 值 | 说明 |
-| --- | --- |
-| `json` | 本地 JSON 文件，默认方式 |
-| `sqlite` | 本地 SQLite，通常存放在 `data/accounts.db` |
-| `postgres` | 外部 PostgreSQL |
-| `git` | Git 私有仓库存储账号数据 |
-
-PostgreSQL 示例：
+外部 PostgreSQL 示例：
 
 ```yaml
 environment:
-  - STORAGE_BACKEND=postgres
-  - DATABASE_URL=postgresql://user:password@host:5432/dbname
+  STORAGE_BACKEND: postgres
+  DATABASE_URL: postgresql://user:password@host:5432/dbname
 ```
 
-SQLite 示例：
+切换存储后端前先备份数据，并确认运行模式实际将相关环境变量传入容器。
 
-```yaml
-environment:
-  - STORAGE_BACKEND=sqlite
-  - DATABASE_URL=sqlite:////app/data/accounts.db
-```
+## 备份、升级与回滚
 
-## 升级前备份
-
-升级前建议备份：
+部署脚本默认使用宿主机挂载，因此备份应覆盖持久化位置：
 
 ```bash
-mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
+sudo tar -czf chatcanvas-$(date +%Y%m%d-%H%M%S).tgz \
+  /etc/chatgpt2api/config.json \
+  /etc/chatgpt2api/data
 ```
 
-如果没有 `.env`，可以去掉：
+使用自定义挂载路径时，替换为实际路径。WARP 部署如使用 `.env` 保存运行时配置，也应单独安全备份该文件。
+
+升级：
 
 ```bash
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json data
+git pull --ff-only
+./scripts/docker-up.sh
 ```
 
-也可以在后台设置页配置 Cloudflare R2 备份，用于定时备份关键数据。
-
-## 升级：普通 Docker 部署
-
-进入项目目录：
+WARP 模式使用：
 
 ```bash
-cd chatgpt2api
+git pull --ff-only
+./scripts/docker-up.sh --warp
 ```
 
-备份：
+回滚前先停止服务、确认目标提交和备份可用，再切换到目标提交并通过对应启动脚本重建。不要用重置或强制覆盖替代受控的 Git 历史操作。
+
+## 受控生产部署
+
+`scripts/deploy-production.sh` 用于已经配置 SSH 目标的生产环境。它要求本地 `main` 已推送到指定 Git remote，随后通过 Git bundle 传输提交，不要求服务器访问 GitHub；远端工作树有未提交改动时会拒绝继续。
 
 ```bash
-mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
+./scripts/deploy-production.sh --dry-run
+./scripts/deploy-production.sh
 ```
 
-拉取最新代码和镜像：
+脚本在远端执行受控 fast-forward、调用统一启动脚本、检查容器和健康接口，并且仅删除没有容器引用的旧镜像。部署前确认 `DEPLOY_HOST`、`DEPLOY_PORT`、`DEPLOY_PATH`、`DEPLOY_SOURCE_REMOTE` 和 `DEPLOY_HEALTH_URL` 的环境覆盖值符合目标环境。
 
-```bash
-git pull
-docker compose pull
-docker compose up -d
-```
+## 聊天附件与安全
 
-查看状态：
+普通聊天可发送图片、PDF 和 Office 文档，但实际读取依赖可用的原生 ChatGPT 文本账号。上传协议已经实现；本仓库开发环境尚未用可用原生账号完成 PDF/Office 的外部读取验收。上线前请按[功能状态](./feature-status.en.md)执行适用的 opt-in 验证。
 
-```bash
-docker compose ps
-docker logs -f chatgpt2api
-```
-
-## 升级：WARP / FlareSolverr 部署
-
-进入项目目录：
-
-```bash
-cd chatgpt2api
-```
-
-备份：
-
-```bash
-mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
-```
-
-拉取最新代码并重新构建：
-
-```bash
-git pull
-docker compose -f docker-compose.warp.yml up -d --build
-```
-
-查看状态：
-
-```bash
-docker compose -f docker-compose.warp.yml ps
-docker logs -f chatgpt2api-warp
-```
-
-## 升级：源码运行
-
-```bash
-cd chatgpt2api
-git pull
-uv sync
-```
-
-如果需要重新构建前端静态产物：
-
-```bash
-cd web
-bun install
-bun run build
-```
-
-然后按你的进程管理方式重启后端服务。
-
-## 回滚
-
-如果升级后需要回滚代码：
-
-```bash
-git log --oneline -n 20
-git checkout <旧版本commit>
-```
-
-普通 Docker 部署：
-
-```bash
-docker compose up -d
-```
-
-WARP / FlareSolverr 部署：
-
-```bash
-docker compose -f docker-compose.warp.yml up -d --build
-```
-
-如果需要恢复数据：
-
-```bash
-tar -xzf backups/你的备份文件.tgz
-```
-
-恢复数据前建议先停止容器，避免运行中写入覆盖：
-
-```bash
-docker compose down
-```
-
-或：
-
-```bash
-docker compose -f docker-compose.warp.yml down
-```
-
-## 常用维护命令
-
-查看容器：
-
-```bash
-docker compose ps
-```
-
-查看主服务日志：
-
-```bash
-docker logs -f chatgpt2api
-```
-
-查看 WARP 部署主服务日志：
-
-```bash
-docker logs -f chatgpt2api-warp
-```
-
-重启普通部署：
-
-```bash
-docker compose restart
-```
-
-重启 WARP 部署：
-
-```bash
-docker compose -f docker-compose.warp.yml restart
-```
-
-清理未使用镜像：
-
-```bash
-docker image prune
-```
-
-不要直接删除 `data/`、`config.json`、`.env`，除非已经确认有可用备份。
+浏览器会话状态不会作为服务端聊天历史同步，但服务调用日志可能保留请求摘要和调用元数据。请依据所在组织的保留策略配置数据目录权限、日志访问和备份范围。
