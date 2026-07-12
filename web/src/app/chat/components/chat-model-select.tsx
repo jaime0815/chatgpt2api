@@ -39,7 +39,7 @@ export function ChatModelSelect({
   const chatModels = filterChatModels(models)
   const hasSelectableModels = chatModels.some((model) => model !== "auto")
   const selected = hasSelectableModels && chatModels.includes(value) ? value : "auto"
-  const providerGroups = groupModelIdsByProvider(chatModels)
+  const providerGroups = groupModelIdsByProvider(chatModels.filter((model) => model !== "auto"))
 
   return (
     <div className={cn("flex min-w-0 flex-col items-center gap-0.5", className)}>
@@ -52,6 +52,9 @@ export function ChatModelSelect({
         </SelectTrigger>
         {hasSelectableModels ? (
           <SelectContent position="popper" align="center" className="min-w-[200px] rounded-md">
+            <SelectItem value="auto" className="rounded-md">
+              自动
+            </SelectItem>
             {providerGroups.map((group) => (
               <SelectGroup key={group.id}>
                 <SelectLabel className="px-3 py-1.5 text-[11px] text-muted-foreground">

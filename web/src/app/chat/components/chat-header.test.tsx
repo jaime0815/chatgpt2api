@@ -42,14 +42,17 @@ describe("ChatModelSelect", () => {
     expect(screen.queryByRole("option", { name: "gpt-image-2" })).not.toBeInTheDocument()
     expect(screen.getByText("OpenAI")).toBeInTheDocument()
     expect(screen.getByText("Anthropic")).toBeInTheDocument()
+    expect(screen.getByText("OpenAI").parentElement).not.toContainElement(
+      screen.getByRole("option", { name: "自动" }),
+    )
     await user.click(screen.getByRole("option", { name: "claude-sonnet-4" }))
     expect(onValueChange).toHaveBeenCalledWith("claude-sonnet-4")
   })
 
-  it("does not expose a selectable list when no text model is available", () => {
+  it("does not expose a selectable list when only visual generation models are available", () => {
     render(
       <ChatModelSelect
-        models={["gpt-image-2"]}
+        models={["gpt-image-2", "dall-e-3", "imagen-3", "cogview-4"]}
         value="auto"
         onValueChange={vi.fn()}
       />,

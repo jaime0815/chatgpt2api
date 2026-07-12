@@ -1,5 +1,10 @@
 export const AUTO_CHAT_MODEL_ID = "auto"
 
+const imageModelPatterns = [
+  /image/i,
+  /^(?:dall-e|dalle|imagen|cogview|flux|stable-diffusion|sdxl|recraft|midjourney|ideogram|seedream)(?:[-_.:/]|$)/i,
+]
+
 type ChatModelLike = string | { id?: unknown }
 
 export type ChatModelSelectionResolution = {
@@ -12,7 +17,8 @@ function modelId(item: ChatModelLike) {
 }
 
 export function isImageModelId(id: string) {
-  return String(id || "").trim().toLowerCase().includes("image")
+  const normalized = String(id || "").trim()
+  return imageModelPatterns.some((pattern) => pattern.test(normalized))
 }
 
 export function filterChatModels(models: readonly ChatModelLike[]) {

@@ -8,6 +8,9 @@ describe("chat model helpers", () => {
     expect(isImageModelId("codex-gpt-image-2")).toBe(true)
     expect(isImageModelId("team-codex-gpt-image-2")).toBe(true)
     expect(isImageModelId(" GPT-IMAGE-2 ")).toBe(true)
+    expect(isImageModelId("dall-e-3")).toBe(true)
+    expect(isImageModelId("imagen-3")).toBe(true)
+    expect(isImageModelId("cogview-4")).toBe(true)
     expect(isImageModelId("gpt-5.4")).toBe(false)
   })
 
