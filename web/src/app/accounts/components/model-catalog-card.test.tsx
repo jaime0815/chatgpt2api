@@ -34,8 +34,10 @@ describe("ModelCatalogCard", () => {
     )
 
     expect(screen.getByText("系统可用模型")).toBeInTheDocument()
-    expect(screen.getByText("(1)")).toBeInTheDocument()
+    expect(screen.getByText("系统可用模型")).toHaveTextContent("系统可用模型(1)")
+    expect(screen.getByRole("heading", { name: "OpenAI(1)" })).toBeInTheDocument()
     expect(screen.getByText("gpt-latest")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "复制模型 gpt-latest" })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: "刷新系统模型" }))
 
@@ -54,5 +56,31 @@ describe("ModelCatalogCard", () => {
     )
 
     expect(screen.getByRole("button", { name: "正在刷新系统模型" })).toBeDisabled()
+  })
+
+  it("renders each non-empty provider as a separate model section", () => {
+    render(
+      <ModelCatalogCard
+        models={[
+          ...models,
+          {
+            id: "claude-sonnet-4",
+            object: "model",
+            created: 0,
+            owned_by: "anthropic",
+            permission: [],
+            root: "claude-sonnet-4",
+            parent: null,
+          },
+        ]}
+        isLoading={false}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onCopy={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole("heading", { name: "OpenAI(1)" })).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Anthropic(1)" })).toBeInTheDocument()
   })
 })
