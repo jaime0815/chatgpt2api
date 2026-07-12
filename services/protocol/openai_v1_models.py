@@ -11,10 +11,11 @@ def list_models(*, refresh: bool = False) -> dict[str, Any]:
     """Discover the current upstream model directory for each request.
 
     ``refresh`` records an explicit client refresh request. The upstream call is
-    intentionally made for both paths, so no process-local catalog can become
-    stale.
+    intentionally made for both paths through an available text account. When
+    no text account exists, the client uses the anonymous upstream directory.
     """
-    backend = OpenAIBackendAPI()
+    access_token = account_service.get_text_access_token()
+    backend = OpenAIBackendAPI(access_token=access_token)
     try:
         result = backend.list_models()
     finally:

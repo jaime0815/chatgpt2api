@@ -58,11 +58,11 @@ import {
   type Model,
   type RefreshProgressResponse,
 } from "@/lib/api";
-import { withBasePath } from "@/lib/paths";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
+import { ModelCatalogCard } from "./components/model-catalog-card";
 
 const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
   { label: "全部状态", value: "all" },
@@ -168,6 +168,7 @@ function displayAccountSource(account: Account) {
 
 function AccountsPageContent() {
   const didLoadRef = useRef(false);
+  const modelRequestIdRef = useRef(0);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -182,6 +183,7 @@ function AccountsPageContent() {
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
+  const [isRefreshingModels, setIsRefreshingModels] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
@@ -221,16 +223,30 @@ function AccountsPageContent() {
     }
   };
 
-  const loadModels = async () => {
+  const loadModels = async (refresh = false) => {
+    const requestId = modelRequestIdRef.current + 1;
+    modelRequestIdRef.current = requestId;
     setIsLoadingModels(true);
+    if (refresh) {
+      setIsRefreshingModels(true);
+    }
     try {
-      const data = await fetchModels();
+      const data = refresh ? await fetchModels({ refresh: true }) : await fetchModels();
+      if (requestId !== modelRequestIdRef.current) {
+        return;
+      }
       setAvailableModels(Array.isArray(data.data) ? data.data : []);
     } catch (error) {
+      if (requestId !== modelRequestIdRef.current) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "加载模型列表失败";
-      toast.error(message);
+      toast.error(refresh ? `刷新模型失败：${message}` : message);
     } finally {
-      setIsLoadingModels(false);
+      if (requestId === modelRequestIdRef.current) {
+        setIsLoadingModels(false);
+        setIsRefreshingModels(false);
+      }
     }
   };
 
@@ -869,39 +885,17 @@ function AccountsPageContent() {
           })}
         </div>
         <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
-          <CardContent className="p-4">
-            <div className="mb-3 text-sm font-medium text-stone-700">
-              系统可用模型
-              <span className="ml-1 text-stone-400">({availableModels.length})</span>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {availableModels.length > 0 ? (
-                availableModels.map((model) => (
-                  <button
-                    key={model.id}
-                    type="button"
-                    className="inline-flex cursor-pointer items-center rounded-full border border-stone-200 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50"
-                    onClick={() => {
-                      void navigator.clipboard.writeText(model.id);
-                      toast.success("模型名已复制");
-                    }}
-                    title={`点击复制 ${model.id}`}
-                  >
-                    <img
-                      src={withBasePath("/openai.svg")}
-                      alt=""
-                      aria-hidden="true"
-                      className="mr-1.5 size-3.5 shrink-0"
-                    />
-                    {model.id}
-                  </button>
-                ))
-              ) : isLoadingModels ? (
-                <span className="text-sm text-stone-400">正在加载模型列表...</span>
-              ) : (
-                <span className="text-sm text-stone-400">当前暂无可用模型</span>
-              )}
-            </div>
+          <CardContent className="p-0">
+            <ModelCatalogCard
+              models={availableModels}
+              isLoading={isLoadingModels}
+              isRefreshing={isRefreshingModels}
+              onRefresh={() => void loadModels(true)}
+              onCopy={(modelId) => {
+                void navigator.clipboard.writeText(modelId);
+                toast.success("模型名已复制");
+              }}
+            />
           </CardContent>
         </Card>
       </section>

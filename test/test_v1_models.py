@@ -18,12 +18,53 @@ AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
 
 
 class ModelListTests(unittest.TestCase):
+    def test_list_models_uses_available_text_account_for_upstream_discovery(self):
+        backend = mock.Mock()
+        backend.list_models.return_value = {"object": "list", "data": []}
+
+        with (
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "get_text_access_token",
+                return_value="text-account-token",
+            ),
+            mock.patch.object(openai_v1_models, "OpenAIBackendAPI", return_value=backend) as backend_type,
+            mock.patch.object(openai_v1_models.account_service, "list_accounts", return_value=[]),
+        ):
+            openai_v1_models.list_models()
+
+        backend_type.assert_called_once_with(access_token="text-account-token")
+        backend.close.assert_called_once_with()
+
+    def test_list_models_falls_back_to_anonymous_discovery_without_text_account(self):
+        backend = mock.Mock()
+        backend.list_models.return_value = {"object": "list", "data": []}
+
+        with (
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "get_text_access_token",
+                return_value="",
+            ),
+            mock.patch.object(openai_v1_models, "OpenAIBackendAPI", return_value=backend) as backend_type,
+            mock.patch.object(openai_v1_models.account_service, "list_accounts", return_value=[]),
+        ):
+            openai_v1_models.list_models()
+
+        backend_type.assert_called_once_with(access_token="")
+        backend.close.assert_called_once_with()
+
     def test_list_models_only_returns_image_models_backed_by_account_types(self):
         with (
             mock.patch.object(
                 openai_v1_models.OpenAIBackendAPI,
                 "list_models",
                 return_value={"object": "list", "data": []},
+            ),
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "get_text_access_token",
+                return_value="",
             ),
             mock.patch.object(
                 openai_v1_models.account_service,
@@ -50,6 +91,11 @@ class ModelListTests(unittest.TestCase):
                 openai_v1_models.OpenAIBackendAPI,
                 "list_models",
                 return_value={"object": "list", "data": []},
+            ),
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "get_text_access_token",
+                return_value="",
             ),
             mock.patch.object(
                 openai_v1_models.account_service,
