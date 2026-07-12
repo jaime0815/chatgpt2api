@@ -124,7 +124,10 @@ def test_remote_execution_transmits_safe_update_and_cleanup_steps(tmp_path: Path
     assert 'compose -f "$compose_file" up -d --force-recreate --remove-orphans --no-build' in payload
     assert 'docker image inspect --format' in payload
     assert 'docker ps -aq --filter "ancestor=$old_image_id"' in payload
+    assert "check_health()" in payload
+    assert "for ((health_attempt = 1; health_attempt <= 15; health_attempt++)); do" in payload
     assert 'health_response="$(curl --fail --show-error --silent' in payload
+    assert 'sleep 2' in payload
     assert "grep -Eq '\"healthy\"[[:space:]]*:[[:space:]]*true'" in payload
     assert "git stash" not in payload
     assert "git pull" not in payload

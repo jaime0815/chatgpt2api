@@ -151,6 +151,28 @@ cleanup_bundle() {
 }
 trap cleanup_bundle EXIT
 
+check_health() {
+  local health_response="" health_attempt
+
+  for ((health_attempt = 1; health_attempt <= 15; health_attempt++)); do
+    log "Checking health at $health_url (attempt $health_attempt/15)."
+    if health_response="$(curl --fail --show-error --silent --connect-timeout 5 --max-time 15 "$health_url")"; then
+      if printf '%s' "$health_response" | grep -Eq '"healthy"[[:space:]]*:[[:space:]]*true'; then
+        return 0
+      fi
+      log "Health endpoint did not report healthy=true on attempt $health_attempt/15."
+    else
+      log "Health request failed on attempt $health_attempt/15; retrying."
+    fi
+
+    if (( health_attempt < 15 )); then
+      sleep 2
+    fi
+  done
+
+  fail "Health endpoint did not report healthy=true after 15 attempts."
+}
+
 require_remote_command git
 require_remote_command docker
 require_remote_command curl
@@ -316,11 +338,7 @@ app_container_id="$(compose -f "$compose_file" ps -q app)"
 [[ -n "$app_container_id" ]] || fail "The app service did not create a container."
 [[ "$(docker inspect --format '{{.State.Running}}' "$app_container_id")" == "true" ]] || fail "The app container is not running."
 
-log "Checking health at $health_url."
-health_response="$(curl --fail --show-error --silent --retry 15 --retry-connrefused --retry-delay 2 --connect-timeout 5 --max-time 15 "$health_url")"
-if ! printf '%s' "$health_response" | grep -Eq '"healthy"[[:space:]]*:[[:space:]]*true'; then
-  fail "Health endpoint did not report healthy=true."
-fi
+check_health
 
 for image_ref in "${image_refs[@]}"; do
   if current_image_id="$(docker image inspect --format '{{.Id}}' "$image_ref" 2>/dev/null)"; then
